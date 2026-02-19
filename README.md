@@ -1,2 +1,59 @@
-# rcic
-RC Info Center, a lightweight telemetry dashboard for EdgeTX 2.9+ with battery alerts, valid GPS check &amp; Plus Code generation
+# RC Info Center (RCIC) for EdgeTX
+
+**RC Info Center (rcic.lua)** is a lightweight, fast, and highly optimized telemetry script designed for radio controllers (RC) running EdgeTX (or compatible with OpenTX).
+
+It provides an interactive 3-screen dashboard ("BAT", "GPS", and "TOT"), allowing you to constantly monitor your battery health, pinpoint your geographic position with high precision, and review your flight statistics.
+
+![RC Info Center](https://img.shields.io/badge/EdgeTX-2.9%2B-blue)
+![License](https://img.shields.io/badge/License-MIT-green)
+
+---
+
+## 🌟 Key Features
+
+### 1. Smart Battery System (BAT Screen)
+- **Auto Cell Detection:** Detects whether your battery is 1S, 2S, 3S, 4S... based on the active telemetry voltage without requiring menu confirmation.
+- **Multi-Chemistry Support:** Quickly switch between **LiPo, LiHV, and LiIon** (and their associated voltages) by simply pressing the main button (ENTER).
+- **Relative Percentage Graph and Extremes:** A progressive and accurate visualizer of the battery percentage relative to the minimum safe flight voltage.
+- **Voltage Alerts:** Configurable audible announcements if a cell drops below the safe margin for your battery's chemistry, preventing irreversible damage.
+
+### 2. Optimized GPS Dashboard (GPS Screen)
+- **Simultaneous Reading:** Monitor your `Latitude`, `Longitude`, `Altitude`, and the number of `Satellites (Sats)` at a glance.
+- **High-Precision Open Location Codes:** The script automatically generates extended 11-character local "Plus Codes" (e.g., `8FH4C53F+9J2`). It provides technical local precision (up to a 2-3 meter offline grid) to infallibly locate a crashed model.
+- **Advanced Cache Management:** Designed with the Lua Garbage Collector in mind, it stops `string` recalculations if the drone is stationary, saving precious CPU cycles.
+
+### 3. Total Flight Statistics (TOT Screen)
+Automatically saves the absolute minimums and major milestones of your session.
+- **Absolute Minimum Voltage:** Useful for viewing the maximum battery *voltage sag* during climbs or punch-outs.
+- **Distance:** Live internal computation using Equirectangular projection.
+- **Flight Extremes:** Maximum Altitude, Peak Current (Amperage), and Maximum Speed.
+- **Manual Reset:** Everything can be quickly reset by pressing ENTER on this specific tab.
+
+---
+
+## ⚙️ Requirements
+- **Operating System:** Radio supported by EdgeTX v2.9 or higher. Likely compatible with OpenTX systems.
+- **Compatible Protocols:** ELRS, Crossfire, or other telemetry protocols that expose basic sensors for RxBt, Satellites, GPS (Lat, Lon, Alt), and Speed via the Lua `getValue()` function.
+- **Sensor:** A GPS module holding a minimum of 4 or more linked satellites to start reporting a valid location and acquire a *Fix*.
+
+## 🚀 Installation & Usage
+
+1. Download the `rcic.lua` file.
+2. Connect your radio controller to your PC via USB and mount the SD Card or Mass Storage.
+3. Copy `rcic.lua` into the `SCRIPTS/TELEMETRY` folder on your SD card.
+4. Disconnect the radio.
+5. From your selected model's menu ("Telemetry" button/page), pick the empty screen slot you prefer.
+6. Set the type to **Script** and choose **`rcic`** as your main script.
+
+**Navigation:**
+Once on the new "Info Center" screen, use your scroll wheel, directional pad, or menu navigation axis to cycle freely forward and backward across the 3 views.
+
+---
+
+## 👨‍💻 About the Author and License
+
+Created and optimized by **Alonso Lara** ([@AlonsoLP](https://github.com/AlonsoLP)).
+
+This project is part of a continuous effort to push the limits of the Lua environment inside constrained STM32 processors, utilizing precalculated routines of local variables, systematic removal of useless concatenations, and ultra-low GC (Garbage Collection) cycles.
+
+**License:** Provided "As is" under the **MIT** License, allowing you to use and modify this script on as many radio controllers as you'd like without restriction. The original developer is exempt from any liability regarding the physical integrity of the vehicle or operated equipment. Please see the `rcic.lua` file to read the extended license block.

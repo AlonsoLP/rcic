@@ -1,7 +1,7 @@
 -- =========================================================================
 -- rcic.lua — RC Info Center
 --
--- Version:     1.01
+-- Version:     1.02
 -- Date:        2026-02-19
 -- Author:      Alonso Lara (github.com/AlonsoLP)
 -- Description: Lightweight telemetry dashboard for EdgeTX 2.9+ with
@@ -518,7 +518,9 @@ local function run(event)
             bat_state.lbl_vmax = string_fmt("%.2fV", bcfg.v_max)
             show_toast(string_fmt("** %s (%.1fv) **", bcfg.text, bat_state.threshold))
         elseif current_page == 2 then
-            screenshot()
+            if type(screenshot) == "function" then
+                screenshot()
+            end
             show_toast("** SCREENSHOT **")
         elseif current_page == 3 then
             reset_stats()
@@ -561,7 +563,7 @@ local function run(event)
         -- Plus code only if coordinates change
         if gps_state.lat ~= cur_lat or gps_state.lon ~= cur_lon then
             gps_state.plus_code = to_plus_code(cur_lat, cur_lon)
-            gps_state.plus_code_url = "PLUS.CODES/" .. gps_state.plus_code
+            gps_state.plus_code_url = "+CODE " .. gps_state.plus_code
             gps_state.lat_str = string_fmt("%.6f", cur_lat)
             gps_state.lon_str = string_fmt("%.6f", cur_lon)
 

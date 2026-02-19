@@ -9,7 +9,7 @@ It provides an interactive 3-screen dashboard ("BAT", "GPS", and "TOT"), allowin
 
 ---
 
-## 🌟 Key Features
+## Key Features
 
 ### 1. Smart Battery System (BAT Screen)
 - **Auto Cell Detection:** Detects whether your battery is 1S, 2S, 3S, 4S... based on the active telemetry voltage without requiring menu confirmation.
@@ -21,6 +21,7 @@ It provides an interactive 3-screen dashboard ("BAT", "GPS", and "TOT"), allowin
 - **Simultaneous Reading:** Monitor your `Latitude`, `Longitude`, `Altitude`, and the number of `Satellites (Sats)` at a glance.
 - **High-Precision Open Location Codes:** The script automatically generates extended 11-character local "Plus Codes" (e.g., `8FH4C53F+9J2`). It provides technical local precision (up to a 2-3 meter offline grid) to infallibly locate a crashed model.
 - **Advanced Cache Management:** Designed with the Lua Garbage Collector in mind, it stops `string` recalculations if the drone is stationary, saving precious CPU cycles.
+- **Save Position:** Quickly generates a screenshot with the GPS position in the /SCREENSHOTS folder by pressing the main button (ENTER).
 
 ### 3. Total Flight Statistics (TOT Screen)
 Automatically saves the absolute minimums and major milestones of your session.
@@ -50,10 +51,4 @@ Once on the new "Info Center" screen, use your scroll wheel, directional pad, or
 
 ---
 
-## 👨‍💻 About the Author and License
-
-Created and optimized by **Alonso Lara** ([@AlonsoLP](https://github.com/AlonsoLP)).
-
 This project is part of a continuous effort to push the limits of the Lua environment inside constrained STM32 processors, utilizing precalculated routines of local variables, systematic removal of useless concatenations, and ultra-low GC (Garbage Collection) cycles.
-
-**License:** Provided "As is" under the **MIT** License, allowing you to use and modify this script on as many radio controllers as you'd like without restriction. The original developer is exempt from any liability regarding the physical integrity of the vehicle or operated equipment. Please see the `rcic.lua` file to read the extended license block.

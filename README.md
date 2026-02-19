@@ -12,6 +12,9 @@ It provides an interactive 3-screen dashboard ("BAT", "GPS", and "TOT"), allowin
 ## Key Features
 
 ### 1. Smart Battery System (BAT Screen)
+<p align="center">
+   <img src="https://github.com/user-attachments/files/25429081/BAT2.bmp" width="128" height="64">
+</p>
 - **Auto Cell Detection:** Detects whether your battery is 1S, 2S, 3S, 4S... based on the active telemetry voltage without requiring menu confirmation.
 - **Multi-Chemistry Support:** Quickly switch between **LiPo, LiHV, and LiIon** (and their associated voltages) by simply pressing the main button (ENTER).
 - **Relative Percentage Graph and Extremes:** A progressive and accurate visualizer of the battery percentage relative to the minimum safe flight voltage.
@@ -50,5 +53,6 @@ Automatically saves the absolute minimums and major milestones of your session.
 Once on the new "Info Center" screen, use your scroll wheel, directional pad, or menu navigation axis to cycle freely forward and backward across the 3 views.
 
 ---
+
 
 This project is part of a continuous effort to push the limits of the Lua environment inside constrained STM32 processors, utilizing precalculated routines of local variables, systematic removal of useless concatenations, and ultra-low GC (Garbage Collection) cycles.

@@ -54,7 +54,7 @@ Automatically saves the absolute minimums and major milestones of your session.
 - **Compatible Protocols:** ELRS, Crossfire, or other telemetry protocols that expose basic sensors for RxBt, Satellites, GPS (Lat, Lon, Alt), and Speed via the Lua `getValue()` function.
 - **Sensor:** A GPS module holding a minimum of 4 or more linked satellites to start reporting a valid location and acquire a *Fix*.
 
-## 🚀 Installation & Usage
+## Installation
 
 1. Download the `rcic.lua` file.
 2. Connect your radio controller to your PC via USB and mount the SD Card or Mass Storage.
@@ -63,18 +63,20 @@ Automatically saves the absolute minimums and major milestones of your session.
 5. From your selected model's menu ("Telemetry" button/page), pick the empty screen slot you prefer.
 6. Set the type to **Script** and choose **`rcic`** as your main script.
 
-**Navigation:**
-Use your scroll wheel, directional pad, or menu navigation axis to cycle freely forward and backward across the 3 views.
+##  Usage
 
-**Press ENTER in:**
-1. **BAT**: switch between LiPo, LiHV, and LiIon.
-2. **GPS**: make a screenshot.
-3. **TOT**: Reset stats.
+Use your **scroll wheel**, directional pad, or menu navigation axis to cycle forward and backward across the views.
+
+Press **ENTER** in:
+1. **BAT**, to switch between LiPo, LiHV, and LiIon.
+2. **GPS**, to make a screenshot.
+3. **TOT**, to reset stats.
 
 ---
 
 
 This project is part of a continuous effort to push the limits of the Lua environment inside constrained STM32 processors, utilizing precalculated routines of local variables, systematic removal of useless concatenations, and ultra-low GC (Garbage Collection) cycles.
+
 
 
 

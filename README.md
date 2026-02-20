@@ -64,12 +64,18 @@ Automatically saves the absolute minimums and major milestones of your session.
 6. Set the type to **Script** and choose **`rcic`** as your main script.
 
 **Navigation:**
-Once on the new "Info Center" screen, use your scroll wheel, directional pad, or menu navigation axis to cycle freely forward and backward across the 3 views.
+Use your scroll wheel, directional pad, or menu navigation axis to cycle freely forward and backward across the 3 views.
+
+**Press ENTER in:**
+1. **BAT**: switch between LiPo, LiHV, and LiIon.
+2. **GPS**: make a screenshot.
+3. **TOT**: Reset stats.
 
 ---
 
 
 This project is part of a continuous effort to push the limits of the Lua environment inside constrained STM32 processors, utilizing precalculated routines of local variables, systematic removal of useless concatenations, and ultra-low GC (Garbage Collection) cycles.
+
 
 
 

@@ -33,7 +33,7 @@ It provides an interactive 3-screen dashboard ("BAT", "GPS", and "TOT"), allowin
 - **Simultaneous Reading:** Monitor your `Latitude`, `Longitude`, `Altitude`, and the number of `Satellites (Sats)` at a glance.
 - **High-Precision Open Location Codes:** The script automatically generates extended 11-character local "Plus Codes". It provides technical local precision (up to a 2-3 meter offline grid) to infallibly locate a crashed model.
 - **Advanced Cache Management:** Designed with the Lua Garbage Collector in mind, it stops `string` recalculations if the drone is stationary, saving precious CPU cycles.
-- **Save Position:** Quickly generates a screenshot with the GPS position in the /SCREENSHOTS folder by pressing the main button (ENTER).
+- **Save Position:** Quickly generates a screenshot with the GPS position in the `SCREENSHOTS` folder by pressing the main button (ENTER).
 
 ### 3. Total Flight Statistics (TOT Screen)
 
@@ -70,5 +70,6 @@ Once on the new "Info Center" screen, use your scroll wheel, directional pad, or
 
 
 This project is part of a continuous effort to push the limits of the Lua environment inside constrained STM32 processors, utilizing precalculated routines of local variables, systematic removal of useless concatenations, and ultra-low GC (Garbage Collection) cycles.
+
 
 

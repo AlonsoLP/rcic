@@ -1,7 +1,7 @@
 -- =========================================================================
 -- rcic.lua — RC Info Center
 --
--- Version:     1.02
+-- Version:     1.1
 -- Date:        2026-02-19
 -- Author:      Alonso Lara (github.com/AlonsoLP)
 -- Description: Lightweight telemetry dashboard for EdgeTX 2.9+ with
@@ -73,50 +73,16 @@ local playNumber             = playNumber
 -- ------------------------------------------------------------
 -- 3. SCREEN AND FONT DETECTION
 -- ------------------------------------------------------------
-local SCREEN_W               = LCD_W or 128
-local SCREEN_H               = LCD_H or 64
-
-local FONT_COORDS            = MIDSIZE
-local FONT_INFO              = SMLSIZE
-if SCREEN_W >= 300 then
-    FONT_COORDS = DBLSIZE
-    FONT_INFO   = MIDSIZE
-end
-
-local SCREEN_CENTER_X = SCREEN_W / 2
+local SCREEN_W, SCREEN_H
+local FONT_COORDS, FONT_INFO
+local SCREEN_CENTER_X
 
 -- ------------------------------------------------------------
 -- 4. LAYOUT
 -- ------------------------------------------------------------
-local TAB_H           = 9                    -- tab bar height
-local CONTENT_Y       = TAB_H + 1            -- content start y (10px)
-local CONTENT_H       = SCREEN_H - CONTENT_Y -- available height for content
-
--- Proportional positions within content area
-local LAYOUT          = {
-    -- GPS page
-    coord_lat_y = CONTENT_Y + math_floor(CONTENT_H * 0.10),
-    coord_lon_y = CONTENT_Y + math_floor(CONTENT_H * 0.38),
-    info_y      = CONTENT_Y + math_floor(CONTENT_H * 0.65),
-    url_y       = CONTENT_Y + math_floor(CONTENT_H * 0.84),
-    waiting_y   = CONTENT_Y + math_floor(CONTENT_H * 0.25),
-    sats_y      = CONTENT_Y + math_floor(CONTENT_H * 0.70),
-    -- BAT page
-    bat_label_y = CONTENT_Y + math_floor(CONTENT_H * 0.037),
-    bat_value_y = CONTENT_Y + math_floor(CONTENT_H * 0.222),
-    bat_cell_y  = CONTENT_Y + math_floor(CONTENT_H * 0.25),
-    bat_pct_y   = CONTENT_Y + math_floor(CONTENT_H * 0.63),
-    bat_bar_y   = CONTENT_Y + math_floor(CONTENT_H * 0.815),
-    -- TOT page
-    tot_line1_y = CONTENT_Y + math_floor(CONTENT_H * 0.037),
-    tot_line2_y = CONTENT_Y + math_floor(CONTENT_H * 0.222),
-    tot_line3_y = CONTENT_Y + math_floor(CONTENT_H * 0.407),
-    tot_line4_y = CONTENT_Y + math_floor(CONTENT_H * 0.593),
-    tot_line5_y = CONTENT_Y + math_floor(CONTENT_H * 0.778)
-}
-
-local TABS            = { "BAT", "GPS", "TOT" }
-local TAB_W           = math_floor(SCREEN_W / #TABS)
+local TAB_H, CONTENT_Y, CONTENT_H
+local LAYOUT
+local TABS, TAB_W
 
 -- ------------------------------------------------------------
 -- 5. TRANSLATION SYSTEM
@@ -129,9 +95,8 @@ local function detect_language()
     return "es"
 end
 
-local LANG = detect_language()
-
-local BASE_TEXTS = {
+local LANG
+local BASE_TEXTS        = {
     lost     = "!LOST!",
     waiting  = "WAITING GPS",
     sats     = "SAT",
@@ -146,7 +111,7 @@ local BASE_TEXTS = {
     max_cur  = "MAX AMP",
 }
 
-local LANG_OVERRIDES = {
+local LANG_OVERRIDES    = {
     es = {
         lost     = "!PERDIDO!",
         waiting  = "ESPERANDO GPS",
@@ -251,23 +216,15 @@ local LANG_OVERRIDES = {
     },
 }
 
-local TR = {}
-for k, v in pairs(BASE_TEXTS) do
-    TR[k] = v
-end
-if LANG_OVERRIDES[LANG] then
-    for k, v in pairs(LANG_OVERRIDES[LANG]) do
-        TR[k] = v
-    end
-end
+local TR                = {}
 
 -- ------------------------------------------------------------
 -- 6. PERSISTENT VARIABLES
 -- ------------------------------------------------------------
 
-local current_page     = 1 -- 1=BAT, 2=GPS, 3=TOT
+local current_page      = 1
 
-local gps_state        = {
+local gps_state         = {
     lat           = 0,
     lon           = 0,
     alt           = 0,
@@ -278,9 +235,9 @@ local gps_state        = {
     lon_str       = "0.000000"
 }
 
-local last_update_time = 0
+local last_update_time  = 0
 
-local bat_state        = {
+local bat_state         = {
     cells      = 0,
     last_volt  = 0,
     alert_time = 0,
@@ -290,15 +247,24 @@ local bat_state        = {
     lbl_vmin   = string_fmt("%.2fV", BAT_CONFIG[1].v_min),
     lbl_vmax   = string_fmt("%.2fV", BAT_CONFIG[1].v_max)
 }
-local toast_msg        = nil
-local toast_time       = 0
-local toast_x          = 0
-local toast_y          = 0
-local toast_w          = 0
+local toast_msg         = nil
+local toast_time        = 0
+local toast_x           = 0
+local toast_y           = 0
+local toast_w           = 0
+
+local telemetry_live    = false
+local sats              = 0
+local rx_bt             = 0
+local cell_voltage      = 0
+
+-- Pre-allocate to save GC cycles
+local str_minus_minus_V = "--V"
+local str_minus_minus   = "--"
 
 local function show_toast(msg)
-    toast_msg   = msg
-    toast_time  = getTime()
+    toast_msg = msg
+    toast_time = getTime()
 
     local msg_w = #toast_msg * 6 + 10 -- Width estimation
     if msg_w < 60 then msg_w = 60 end
@@ -339,19 +305,15 @@ local function is_valid_gps(lat, lon)
         not (lat == 0 and lon == 0)
 end
 
--- Plus Code (Open Location Code) — precision ~14m (10 digits)
-
+local lat_divisors = { 800000, 40000, 2000, 100, 5 }
+local lon_divisors = { 640000, 32000, 1600, 80, 4 }
+local alphabet = "23456789CFGHJMPQRVWX"
 
 local function to_plus_code(lat, lon)
-    local alphabet = "23456789CFGHJMPQRVWX"
     lat = math_max(-90, math_min(89.9999, lat)) + 90
     while lon < -180 do lon = lon + 360 end
     while lon >= 180 do lon = lon - 360 end
     lon = lon + 180
-
-    -- Multipliers pre-calculated for the 5 loops (20^(5-i)*5 and 20^(5-i)*4) to avoid CPU-hungry power (^) ops
-    local lat_divisors = { 800000, 40000, 2000, 100, 5 }
-    local lon_divisors = { 640000, 32000, 1600, 80, 4 }
 
     local code = ""
     local lat_val = math_floor(lat * 40000)
@@ -386,15 +348,137 @@ end
 
 -- Format distance (m or km)
 local function format_dist(meters)
-    if meters >= 1000 then
-        return string_fmt("%.2fkm", meters / 1000)
-    else
-        return string_fmt("%.0fm", meters)
+    return meters >= 1000 and string_fmt("%.2fkm", meters / 1000) or string_fmt("%.0fm", meters)
+end
+
+-- ------------------------------------------------------------
+-- 8. INIT FUNCTION
+-- ------------------------------------------------------------
+
+local function init()
+    SCREEN_W    = LCD_W or 128
+    SCREEN_H    = LCD_H or 64
+
+    FONT_COORDS = MIDSIZE
+    FONT_INFO   = SMLSIZE
+    if SCREEN_W >= 300 then
+        FONT_COORDS = DBLSIZE
+        FONT_INFO   = MIDSIZE
+    end
+
+    SCREEN_CENTER_X = SCREEN_W / 2
+    TAB_H           = 9
+    CONTENT_Y       = TAB_H + 1
+    CONTENT_H       = SCREEN_H - CONTENT_Y
+
+    LAYOUT          = {
+        coord_lat_y = CONTENT_Y + math_floor(CONTENT_H * 0.10),
+        coord_lon_y = CONTENT_Y + math_floor(CONTENT_H * 0.38),
+        info_y      = CONTENT_Y + math_floor(CONTENT_H * 0.65),
+        url_y       = CONTENT_Y + math_floor(CONTENT_H * 0.84),
+        waiting_y   = CONTENT_Y + math_floor(CONTENT_H * 0.25),
+        sats_y      = CONTENT_Y + math_floor(CONTENT_H * 0.70),
+        bat_label_y = CONTENT_Y + math_floor(CONTENT_H * 0.037),
+        bat_value_y = CONTENT_Y + math_floor(CONTENT_H * 0.222),
+        bat_cell_y  = CONTENT_Y + math_floor(CONTENT_H * 0.25),
+        bat_pct_y   = CONTENT_Y + math_floor(CONTENT_H * 0.63),
+        bat_bar_y   = CONTENT_Y + math_floor(CONTENT_H * 0.815),
+        tot_line1_y = CONTENT_Y + math_floor(CONTENT_H * 0.037),
+        tot_line2_y = CONTENT_Y + math_floor(CONTENT_H * 0.222),
+        tot_line3_y = CONTENT_Y + math_floor(CONTENT_H * 0.407),
+        tot_line4_y = CONTENT_Y + math_floor(CONTENT_H * 0.593),
+        tot_line5_y = CONTENT_Y + math_floor(CONTENT_H * 0.778)
+    }
+
+    TABS            = { "BAT", "GPS", "TOT" }
+    TAB_W           = math_floor(SCREEN_W / #TABS)
+
+    LANG            = detect_language()
+
+    for k, v in pairs(BASE_TEXTS) do TR[k] = v end
+    if LANG_OVERRIDES[LANG] then
+        for k, v in pairs(LANG_OVERRIDES[LANG]) do TR[k] = v end
     end
 end
 
 -- ------------------------------------------------------------
--- 8. DRAWING FUNCTIONS
+-- 9. DATA UPDATE (BACKGROUND) FUNCTION
+-- ------------------------------------------------------------
+
+local function background()
+    local current_time = getTime()
+    if current_time - last_update_time < UPDATE_RATE then
+        return
+    end
+    last_update_time = current_time
+
+    local gps_data = getValue("GPS")
+    sats = getValue("Sats") or 0
+    rx_bt = getValue("RxBt") or 0
+    local rssi = getValue("RQly") or 0
+    local alt = getValue("Alt") or getValue("GAlt") or 0
+    local gspd = getValue("GSpd") or 0
+    local curr = getValue("Curr") or 0
+
+    telemetry_live = (rssi > 0)
+    local cur_lat, cur_lon = 0, 0
+
+    if type(gps_data) == "table" then
+        cur_lat = gps_data["lat"] or gps_data[1] or 0
+        cur_lon = gps_data["lon"] or gps_data[2] or 0
+    end
+
+    -- --- Update GPS position and stats ---
+    if telemetry_live and sats >= MIN_SATS and is_valid_gps(cur_lat, cur_lon) then
+        if gps_state.lat ~= cur_lat or gps_state.lon ~= cur_lon then
+            gps_state.plus_code = to_plus_code(cur_lat, cur_lon)
+            gps_state.plus_code_url = "+CODE " .. gps_state.plus_code
+            gps_state.lat_str = string_fmt("%.6f", cur_lat)
+            gps_state.lon_str = string_fmt("%.6f", cur_lon)
+
+            if gps_state.fix then
+                local d = fast_dist(gps_state.lat, gps_state.lon, cur_lat, cur_lon)
+                if d < 5000 then
+                    stats.total_dist = stats.total_dist + d
+                end
+            end
+        end
+
+        gps_state.lat = cur_lat
+        gps_state.lon = cur_lon
+        gps_state.alt = alt
+        gps_state.fix = true
+
+        if alt > stats.max_alt then
+            stats.max_alt = alt
+        end
+
+        if gspd > stats.max_speed then
+            stats.max_speed = gspd
+        end
+    end
+
+    if telemetry_live and curr > stats.max_current then
+        stats.max_current = curr
+    end
+
+    -- --- Battery ---
+    if math_abs(rx_bt - bat_state.last_volt) > 1.0 then
+        bat_state.cells = detect_cells(rx_bt)
+    end
+    bat_state.last_volt = rx_bt
+
+    cell_voltage = bat_state.cells > 0 and (rx_bt / bat_state.cells) or 0
+
+    if bat_state.cells > 0 and cell_voltage > 0 then
+        if stats.min_voltage == 0 or cell_voltage < stats.min_voltage then
+            stats.min_voltage = cell_voltage
+        end
+    end
+end
+
+-- ------------------------------------------------------------
+-- 10. DRAWING FUNCTIONS
 -- ------------------------------------------------------------
 
 local function draw_tabs()
@@ -414,13 +498,15 @@ local function draw_tabs()
     end
 end
 
-local function draw_bat_page(rx_bt, cell_voltage, cell_voltage_alert, blink_on)
+local function draw_bat_page(blink_on)
     local bcfg = BAT_CONFIG[bat_state.cfg_idx]
     lcd_drawText(SCREEN_CENTER_X, LAYOUT.bat_value_y,
         string_fmt("%.2fV", rx_bt), DBLSIZE + CENTER)
     lcd_drawText(0, LAYOUT.bat_label_y, TR.vcell, SMLSIZE)
     lcd_drawText(SCREEN_W, LAYOUT.bat_label_y, TR.cells, SMLSIZE + RIGHT)
     lcd_drawText(SCREEN_CENTER_X, LAYOUT.bat_label_y, bcfg.text, SMLSIZE + CENTER)
+
+    local cell_voltage_alert = (BATTERY_ALERT_ENABLED and bat_state.cells > 0 and cell_voltage > 0 and cell_voltage < bat_state.threshold)
 
     if bat_state.cells > 0 then
         local volt_flags = SMLSIZE
@@ -432,14 +518,11 @@ local function draw_bat_page(rx_bt, cell_voltage, cell_voltage_alert, blink_on)
         lcd_drawText(SCREEN_W, LAYOUT.bat_cell_y,
             bat_state.cells .. "S", SMLSIZE + RIGHT)
     else
-        lcd_drawText(0, LAYOUT.bat_cell_y, "--V", SMLSIZE)
-        lcd_drawText(SCREEN_W, LAYOUT.bat_cell_y, "--", SMLSIZE + RIGHT)
+        lcd_drawText(0, LAYOUT.bat_cell_y, str_minus_minus_V, SMLSIZE)
+        lcd_drawText(SCREEN_W, LAYOUT.bat_cell_y, str_minus_minus, SMLSIZE + RIGHT)
     end
 
-    local pct = 0
-    if bat_state.cells > 0 then
-        pct = math_max(0, math_min(1, (cell_voltage - bcfg.v_min) / bcfg.v_range))
-    end
+    local pct = bat_state.cells > 0 and math_max(0, math_min(1, (cell_voltage - bcfg.v_min) / bcfg.v_range)) or 0
 
     local BAR_X = 0
     local BAR_Y = LAYOUT.bat_bar_y
@@ -463,7 +546,7 @@ local function draw_bat_page(rx_bt, cell_voltage, cell_voltage_alert, blink_on)
     end
 end
 
-local function draw_gps_page(telemetry_live, sats, blink_on)
+local function draw_gps_page(blink_on)
     if gps_state.fix and not telemetry_live and blink_on then
         lcd_drawRect(0, CONTENT_Y, SCREEN_W, SCREEN_H - CONTENT_Y, SOLID)
     end
@@ -474,13 +557,11 @@ local function draw_gps_page(telemetry_live, sats, blink_on)
         lcd_drawText(SCREEN_CENTER_X, LAYOUT.coord_lon_y,
             gps_state.lon_str, FONT_COORDS + CENTER)
 
+        local info_str = TR.sats .. ":" .. sats
         if gps_state.alt ~= 0 then
-            local info_str = TR.sats .. ":" .. sats .. "  " .. TR.altitude .. ":" .. math_floor(gps_state.alt) .. "m"
-            lcd_drawText(SCREEN_CENTER_X, LAYOUT.info_y, info_str, FONT_INFO + CENTER)
-        else
-            local info_str = TR.sats .. ":" .. sats
-            lcd_drawText(SCREEN_CENTER_X, LAYOUT.info_y, info_str, FONT_INFO + CENTER)
+            info_str = info_str .. "  " .. TR.altitude .. ":" .. math_floor(gps_state.alt) .. "m"
         end
+        lcd_drawText(SCREEN_CENTER_X, LAYOUT.info_y, info_str, FONT_INFO + CENTER)
 
         lcd_drawText(SCREEN_CENTER_X, LAYOUT.url_y,
             gps_state.plus_code_url, FONT_INFO + CENTER)
@@ -500,13 +581,12 @@ local function draw_tot_page()
         string_fmt("%s: %.0fm", TR.max_alt, stats.max_alt), SMLSIZE)
     lcd_drawText(SCREEN_W, LAYOUT.tot_line2_y,
         string_fmt("%s: %s", TR.distance, format_dist(stats.total_dist)), SMLSIZE + RIGHT)
-    local spd_unit = "kmh"
     lcd_drawText(0, LAYOUT.tot_line3_y,
-        string_fmt("%s: %.1f%s", TR.max_spd, stats.max_speed, spd_unit), SMLSIZE)
+        string_fmt("%s: %.1fkmh", TR.max_spd, stats.max_speed), SMLSIZE)
 end
 
 -- ------------------------------------------------------------
--- 9. MAIN FUNCTION
+-- 11. MAIN FUNCTION
 -- ------------------------------------------------------------
 local function run(event)
     if event == EVT_ENTER_FIRST then
@@ -534,91 +614,12 @@ local function run(event)
         current_page = (current_page - 2) % #TABS + 1
     end
 
-    -- --- Refresh rate control ---
+    -- --- Audio and alarms ---
     local current_time = getTime()
-    if current_time - last_update_time < UPDATE_RATE then
-        return 0
-    end
-    last_update_time       = current_time
-
-    -- --- Read telemetry data ---
-    local gps_data         = getValue("GPS")
-    local sats             = getValue("Sats") or 0
-    local rx_bt            = getValue("RxBt") or 0
-    local rssi             = getValue("RQly") or 0
-    local alt              = getValue("Alt") or getValue("GAlt") or 0
-    local gspd             = getValue("GSpd") or 0
-    local curr             = getValue("Curr") or 0
-
-    local telemetry_live   = (rssi > 0)
-    local cur_lat, cur_lon = 0, 0
-
-    if type(gps_data) == "table" then
-        cur_lat = gps_data["lat"] or gps_data[1] or 0
-        cur_lon = gps_data["lon"] or gps_data[2] or 0
-    end
-
-    -- --- Update GPS position and stats ---
-    if telemetry_live and sats >= MIN_SATS and is_valid_gps(cur_lat, cur_lon) then
-        -- Plus code only if coordinates change
-        if gps_state.lat ~= cur_lat or gps_state.lon ~= cur_lon then
-            gps_state.plus_code = to_plus_code(cur_lat, cur_lon)
-            gps_state.plus_code_url = "+CODE " .. gps_state.plus_code
-            gps_state.lat_str = string_fmt("%.6f", cur_lat)
-            gps_state.lon_str = string_fmt("%.6f", cur_lon)
-
-            -- Accumulated distance
-            if gps_state.fix then
-                local d = fast_dist(gps_state.lat, gps_state.lon, cur_lat, cur_lon)
-                if d < 5000 then -- ignore jumps > 5km (erratic GPS)
-                    stats.total_dist = stats.total_dist + d
-                end
-            end
-        end
-
-        gps_state.lat = cur_lat
-        gps_state.lon = cur_lon
-        gps_state.alt = alt
-        gps_state.fix = true
-
-        -- Max altitude
-        if alt > stats.max_alt then
-            stats.max_alt = alt
-        end
-
-        -- Max Speed
-        if gspd > stats.max_speed then
-            stats.max_speed = gspd
-        end
-    end
-
-    -- Max Current (independent of GPS, but requires telemetry)
-    if telemetry_live and curr > stats.max_current then
-        stats.max_current = curr
-    end
-
-    -- --- Battery ---
-    if math_abs(rx_bt - bat_state.last_volt) > 1.0 then
-        bat_state.cells = detect_cells(rx_bt)
-    end
-    bat_state.last_volt = rx_bt
-
-    local cell_voltage = bat_state.cells > 0 and (rx_bt / bat_state.cells) or 0
-
-    -- Minimum voltage recorded
-    if bat_state.cells > 0 and cell_voltage > 0 then
-        if stats.min_voltage == 0 or cell_voltage < stats.min_voltage then
-            stats.min_voltage = cell_voltage
-        end
-    end
-
-    -- Battery alert system (audio) - USE battery_alert_threshold variable
-    local cell_voltage_alert = false
     if BATTERY_ALERT_ENABLED and bat_state.cells > 0 and cell_voltage > 0 then
         local time_since_alert = current_time - bat_state.alert_time
         local voltage_drop     = bat_state.alert_volt - cell_voltage
-        if cell_voltage < bat_state.threshold then -- DYNAMIC VARIABLE USE
-            cell_voltage_alert = true
+        if cell_voltage < bat_state.threshold then
             if bat_state.alert_volt == 0 or
                 (time_since_alert >= BATTERY_ALERT_INTERVAL and voltage_drop >= BATTERY_ALERT_STEP) then
                 playNumber(math_floor(cell_voltage * 10), 0, PREC1)
@@ -636,17 +637,15 @@ local function run(event)
     draw_tabs()
 
     if current_page == 1 then
-        draw_bat_page(rx_bt, cell_voltage, cell_voltage_alert, blink_on)
+        draw_bat_page(blink_on)
     elseif current_page == 2 then
-        draw_gps_page(telemetry_live, sats, blink_on)
+        draw_gps_page(blink_on)
     elseif current_page == 3 then
         draw_tot_page()
     end
 
     -- Unified message system (Toast)
-    -- Unified message system (Toast)
     if toast_msg and (current_time - toast_time) < 200 then
-        -- Draw background and text (using pre-calculated values)
         lcd_drawFilledRect(toast_x - 2, toast_y - 1, toast_w + 4, 11, SOLID)
         lcd_drawText(SCREEN_CENTER_X, toast_y, toast_msg, SMLSIZE + CENTER + INVERS)
     end
@@ -654,4 +653,4 @@ local function run(event)
     return 0
 end
 
-return { run = run }
+return { init = init, background = background, run = run }

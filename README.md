@@ -51,7 +51,7 @@ Automatically saves the absolute minimums and major milestones of your session.
 
 ---
 
-## ⚙️ Requirements
+## Requirements
 - **Operating System:** Radio supported by EdgeTX v2.9 or higher. Likely compatible with OpenTX systems.
 - **Compatible Protocols:** ELRS, Crossfire, or other telemetry protocols that expose basic sensors for RxBt, Satellites, GPS (Lat, Lon, Alt), and Speed via the Lua `getValue()` function.
 - **Sensor:** A GPS module holding a minimum of 4 or more linked satellites to start reporting a valid location and acquire a *Fix*.
@@ -78,6 +78,7 @@ Press **ENTER** in:
 
 
 This project is part of a continuous effort to push the limits of the Lua environment inside constrained STM32 processors, utilizing precalculated routines of local variables, systematic removal of useless concatenations, and ultra-low GC (Garbage Collection) cycles.
+
 
 
 

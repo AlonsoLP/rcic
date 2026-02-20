@@ -23,12 +23,24 @@ It provides an interactive 3-screen dashboard ("BAT", "GPS", and "TOT"), allowin
 - **Voltage Alerts:** Configurable audible announcements if a cell drops below the safe margin for your battery's chemistry, preventing irreversible damage.
 
 ### 2. Optimized GPS Dashboard (GPS Screen)
+
+<p align="center">
+   <img src="https://github.com/user-attachments/files/25436572/GPS1.bmp" width="128" height="64">
+   &nbsp;
+   <img src="https://github.com/user-attachments/assets/c1d2bee6-6556-416a-87c2-683bc8b5dd13" width="128" height="64">
+</p>
+
 - **Simultaneous Reading:** Monitor your `Latitude`, `Longitude`, `Altitude`, and the number of `Satellites (Sats)` at a glance.
-- **High-Precision Open Location Codes:** The script automatically generates extended 11-character local "Plus Codes" (e.g., `8FH4C53F+9J2`). It provides technical local precision (up to a 2-3 meter offline grid) to infallibly locate a crashed model.
+- **High-Precision Open Location Codes:** The script automatically generates extended 11-character local "Plus Codes". It provides technical local precision (up to a 2-3 meter offline grid) to infallibly locate a crashed model.
 - **Advanced Cache Management:** Designed with the Lua Garbage Collector in mind, it stops `string` recalculations if the drone is stationary, saving precious CPU cycles.
 - **Save Position:** Quickly generates a screenshot with the GPS position in the /SCREENSHOTS folder by pressing the main button (ENTER).
 
 ### 3. Total Flight Statistics (TOT Screen)
+
+<p align="center">
+   <img src="https://github.com/user-attachments/files/25436638/TOT2.bmp" width="128" height="64">
+</p>
+
 Automatically saves the absolute minimums and major milestones of your session.
 - **Absolute Minimum Voltage:** Useful for viewing the maximum battery *voltage sag* during climbs or punch-outs.
 - **Distance:** Live internal computation using Equirectangular projection.
@@ -58,4 +70,5 @@ Once on the new "Info Center" screen, use your scroll wheel, directional pad, or
 
 
 This project is part of a continuous effort to push the limits of the Lua environment inside constrained STM32 processors, utilizing precalculated routines of local variables, systematic removal of useless concatenations, and ultra-low GC (Garbage Collection) cycles.
+
 

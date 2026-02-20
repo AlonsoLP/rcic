@@ -4,6 +4,8 @@
 
 It provides an interactive 3-screen dashboard ("BAT", "GPS", and "TOT"), allowing you to constantly monitor your battery health, pinpoint your geographic position with high precision, and review your flight statistics.
 
+Last update: **v1.1** (2026-02-20)
+
 ![RC Info Center](https://img.shields.io/badge/EdgeTX-2.9%2B-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
@@ -76,6 +78,7 @@ Press **ENTER** in:
 
 
 This project is part of a continuous effort to push the limits of the Lua environment inside constrained STM32 processors, utilizing precalculated routines of local variables, systematic removal of useless concatenations, and ultra-low GC (Garbage Collection) cycles.
+
 
 
 

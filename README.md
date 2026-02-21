@@ -4,7 +4,7 @@
 
 It provides an interactive 3-screen dashboard ("BAT", "GPS", and "TOT"), allowing you to constantly monitor your battery health, pinpoint your geographic position with high precision, and review your flight statistics.
 
-Last update: **v1.31** (2026-02-21)
+Last update: **v1.4** (2026-02-21)
 
 ![RC Info Center](https://img.shields.io/badge/EdgeTX-2.9%2B-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
@@ -40,14 +40,11 @@ Last update: **v1.31** (2026-02-21)
 ### 3. Total Flight Statistics (TOT Screen)
 
 <p align="center">
-   <img src="https://github.com/user-attachments/files/25436638/TOT2.bmp" width="128" height="64">
+   <img src="https://github.com/user-attachments/files/25457929/TOT1.bmp" width="128" height="64">
 </p>
 
-Automatically saves the absolute minimums and major milestones of your session.
-- **Absolute Minimum Voltage:** Useful for viewing the maximum battery *voltage sag* during climbs or punch-outs.
-- **Distance:** Live internal computation using Equirectangular projection.
-- **Flight Extremes:** Maximum Altitude, Peak Current (Amperage), and Maximum Speed.
-- **Manual Reset:** Everything can be quickly reset by pressing ENTER on this specific tab.
+- **Quick check:** The most interesting statistics about your flight at a glance.
+- **Manual Reset:** Everything can be reset by pressing ENTER on this specific tab.
 
 ---
 
@@ -78,6 +75,7 @@ Press **ENTER** in:
 
 
 This project is part of a continuous effort to push the limits of the Lua environment inside constrained STM32 processors, utilizing precalculated routines of local variables, systematic removal of useless concatenations, and ultra-low GC (Garbage Collection) cycles.
+
 
 
 

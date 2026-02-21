@@ -1,7 +1,7 @@
 -- =========================================================================
 -- rcic.lua — RC Info Center
 --
--- Version:     2.11
+-- Version:     2.12
 -- Date:        2026-02-21
 -- Author:      Alonso Lara (github.com/AlonsoLP)
 -- Description: Lightweight telemetry dashboard for EdgeTX 2.9+ with
@@ -46,7 +46,7 @@ local MIN_SATS               = 4
 local BAT_CONFIG             = {
     { text = "LiPo",  volt = 3.5, v_max = 4.2,  v_min = 3.2, v_range = 1.0 },
     { text = "LiHV",  volt = 3.6, v_max = 4.35, v_min = 3.2, v_range = 1.15 },
-    { text = "LiIon", volt = 3.2, v_max = 4.2,  v_min = 2.8, v_range = 1.4 }
+    { text = "LiIon", volt = 3.2, v_max = 4.2,  v_min = 2.8, v_range = 1.4 },
 }
 
 -- ------------------------------------------------------------
@@ -61,6 +61,11 @@ local math_cos               = math.cos
 local math_sqrt              = math.sqrt
 local string_fmt             = string.format
 local string_sub             = string.sub
+local bit32_bxor             = bit32 and bit32.bxor or bit.bxor
+local bit32_band             = bit32 and bit32.band or bit.band
+local bit32_bor              = bit32 and bit32.bor or bit.bor
+local bit32_lshift           = bit32 and bit32.lshift or bit.lshift
+local bit32_rshift           = bit32 and bit32.rshift or bit.rshift
 
 -- EdgeTX API
 local lcd_drawText           = lcd.drawText
@@ -534,7 +539,7 @@ local function generate_qrv2(lat, lon)
     local bi = 0
     local function pb(v, c)
         for i = c - 1, 0, -1 do
-            qr_b[bi] = bit32.band(bit32.rshift(v, i), 1)
+            qr_b[bi] = bit32_band(bit32_rshift(v, i), 1)
             bi = bi + 1
         end
     end
@@ -552,24 +557,24 @@ local function generate_qrv2(lat, lon)
 
     for i = 0, 27 do
         local acc = 0
-        for j = 0, 7 do acc = bit32.lshift(acc, 1) + qr_b[i * 8 + j] end
+        for j = 0, 7 do acc = bit32_lshift(acc, 1) + qr_b[i * 8 + j] end
         qr_m[i + 1] = acc
     end
 
     for i = 1, 16 do qr_ec[i] = 0 end
     for i = 1, 28 do
-        local f = bit32.bxor(qr_m[i], qr_ec[1])
+        local f = bit32_bxor(qr_m[i], qr_ec[1])
         for j = 1, 15 do qr_ec[j] = qr_ec[j + 1] end
         qr_ec[16] = 0
         if f ~= 0 then
             local lf = qr_l[f]
-            for j = 1, 16 do qr_ec[j] = bit32.bxor(qr_ec[j], qr_e[(lf + qr_l[qr_gen[j]]) % 255]) end
+            for j = 1, 16 do qr_ec[j] = bit32_bxor(qr_ec[j], qr_e[(lf + qr_l[qr_gen[j]]) % 255]) end
         end
     end
 
     for i = 1, 16 do
         for j = 7, 0, -1 do
-            qr_b[bi] = bit32.band(bit32.rshift(qr_ec[i], j), 1)
+            qr_b[bi] = bit32_band(bit32_rshift(qr_ec[i], j), 1)
             bi = bi + 1
         end
     end
@@ -587,11 +592,11 @@ local function generate_qrv2(lat, lon)
         for _ = 1, 25 do
             for col = 0, 1 do
                 local nx = cx - col
-                if bit32.band(qr_base[cy + 1][2], bit32.lshift(1, nx)) == 0 then
+                if bit32_band(qr_base[cy + 1][2], bit32_lshift(1, nx)) == 0 then
                     local bit = qr_b[bd]
                     bd = bd + 1
-                    if (cy + nx) % 2 == 0 then bit = bit32.bxor(bit, 1) end
-                    if bit == 1 then res[cy + 1] = bit32.bor(res[cy + 1], bit32.lshift(1, nx)) end
+                    if (cy + nx) % 2 == 0 then bit = bit32_bxor(bit, 1) end
+                    if bit == 1 then res[cy + 1] = bit32_bor(res[cy + 1], bit32_lshift(1, nx)) end
                 end
             end
             cy = cy + dir
@@ -868,7 +873,7 @@ local function draw_gps_page(blink_on)
             for r = 0, 24 do
                 local row_bits = gps_state.qr_cache[r + 1]
                 for c = 0, 24 do
-                    if bit32.band(row_bits, bit32.lshift(1, c)) ~= 0 then
+                    if bit32_band(row_bits, bit32_lshift(1, c)) ~= 0 then
                         -- Dots: ERASE (is black on dark themes)
                         lcd_drawFilledRect(9 + c, LAYOUT.coord_lat_y + r, 1, 1, ERASE or 0)
                     end

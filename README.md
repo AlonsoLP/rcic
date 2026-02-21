@@ -48,7 +48,7 @@ The main screen focused on monitoring the propulsion system.
 <p align="center">
    <img src="https://github.com/user-attachments/files/25436572/GPS1.bmp" width="128" height="64">
    &nbsp;
-   <img src="https://github.com/user-attachments/assets/c1d2bee6-6556-416a-87c2-683bc8b5dd13" width="128" height="64">
+   <img src="https://github.com/user-attachments/assets/3dd1316b-0b81-4db7-b934-58133067bdba" width="128" height="64">
 </p>
 
 Main coordinate visualizer if you are equipping your model with a GNSS/GPS module.
@@ -101,4 +101,5 @@ To cycle or close, press the same invocation key. The interactable data of the s
 5. Disconnect in *Safe USB* mode, return to your EdgeTX controller and make sure to go to the physical preferences of the selected model (Typically pressing *MDL* briefly once).
 6. Press to turn pages (Page >) to the *TELEMETRY* or *DISPLAYS* settings.
 7. Configure *Screen 1* by changing from "Nums/Bars" to **"Script"**, then selecting the destination "rcic".
+
 8. Save properties by returning to your main piloting view, long-pressing the assigned switch. Your metrics will now look impeccable!

@@ -1,7 +1,7 @@
 -- =========================================================================
 -- rcic.lua — RC Info Center
 --
--- Version:     1.4
+-- Version:     2.0
 -- Date:        2026-02-21
 -- Author:      Alonso Lara (github.com/AlonsoLP)
 -- Description: Lightweight telemetry dashboard for EdgeTX 2.9+ with
@@ -32,7 +32,6 @@
 -- ------------------------------------------------------------
 -- 1. USER CONFIGURATION
 -- ------------------------------------------------------------
-local MIN_SATS               = 4    -- minimum satellites to trust position
 local UPDATE_RATE            = 100  -- data update rate (100 = 1s)
 local BATTERY_ALERT_ENABLED  = true -- enable/disable visual battery alerts
 local BATTERY_ALERT_AUDIO    = true -- enable/disable voice/number readout
@@ -43,6 +42,7 @@ local BATTERY_ALERT_STEP     = 0.1  -- voltage drop for new alert
 -- 2. CONSTANTS AND INTERNAL CONFIGURATION
 -- ------------------------------------------------------------
 local CENTISECS_PER_SEC      = 100
+local MIN_SATS               = 4
 local BAT_CONFIG             = {
     { text = "LiPo",  volt = 3.5, v_max = 4.2,  v_min = 3.2, v_range = 1.0 },
     { text = "LiHV",  volt = 3.6, v_max = 4.35, v_min = 3.2, v_range = 1.15 },
@@ -250,8 +250,14 @@ local bat_state         = {
 local toast_msg         = nil
 local toast_time        = 0
 local toast_layout      = { x = 0, y = 0, w = 0, h = 11 }
+local show_cfg          = false
 
 local telemetry_live    = false
+
+local cfg_sel           = 1
+local cfg_edit          = false
+local cfg_changed       = false
+local CFG_FILE          = "/SCRIPTS/TELEMETRY/rcic.cfg"
 
 -- Pre-allocate to save GC cycles
 local str_minus_minus_V = "--V"
@@ -307,15 +313,69 @@ end
 -- 7. UTILITY FUNCTIONS
 -- ------------------------------------------------------------
 
+local function save_config()
+    local file = io.open(CFG_FILE, "w")
+    if file then
+        local cfg_str = string_fmt("%d,%d,%d,%d,%.2f",
+            UPDATE_RATE,
+            BATTERY_ALERT_ENABLED and 1 or 0,
+            BATTERY_ALERT_AUDIO and 1 or 0,
+            BATTERY_ALERT_INTERVAL,
+            BATTERY_ALERT_STEP
+        )
+        io.write(file, cfg_str)
+        io.close(file)
+    end
+end
+
+local function load_config()
+    local file = io.open(CFG_FILE, "r")
+    if file then
+        local content = io.read(file, 200)
+        io.close(file)
+        if content and #content > 0 then
+            -- Expected format: UPDATE_RATE, BAT_ALERT, AUDIO, ALERT_INT, ALERT_STEP
+            -- Example: 50,1,1,500,0.1
+            local comma1 = string.find(content, ",", 1, true)
+            local comma2 = comma1 and string.find(content, ",", comma1 + 1, true)
+            local comma3 = comma2 and string.find(content, ",", comma2 + 1, true)
+            local comma4 = comma3 and string.find(content, ",", comma3 + 1, true)
+
+            if comma1 and comma2 and comma3 and comma4 then
+                local ur_str   = string.sub(content, 1, comma1 - 1)
+                local ba_str   = string.sub(content, comma1 + 1, comma2 - 1)
+                local au_str   = string.sub(content, comma2 + 1, comma3 - 1)
+                local ai_str   = string.sub(content, comma3 + 1, comma4 - 1)
+                local step_str = string.sub(content, comma4 + 1)
+
+                local ur       = tonumber(ur_str)
+                if ur then UPDATE_RATE = ur end
+
+                local ba = tonumber(ba_str)
+                if ba then BATTERY_ALERT_ENABLED = (ba == 1) end
+
+                local au = tonumber(au_str)
+                if au then BATTERY_ALERT_AUDIO = (au == 1) end
+
+                local ai = tonumber(ai_str)
+                if ai then BATTERY_ALERT_INTERVAL = ai end
+
+                local st = tonumber(step_str)
+                if st then BATTERY_ALERT_STEP = st end
+            end
+        end
+    end
+end
+
 local function detect_cells(voltage)
     if voltage < 0.5 then return 0 end
     return math_floor(voltage / 4.3) + 1
 end
 
 local function is_valid_gps(lat, lon)
-    return lat >= -90 and lat <= 90 and
-        lon >= -180 and lon <= 180 and
-        not (lat == 0 and lon == 0)
+    return (lat ~= 0 or lon ~= 0) and
+        lat >= -90 and lat <= 90 and
+        lon >= -180 and lon <= 180
 end
 
 local lat_divisors = { 800000, 40000, 2000, 100, 5 }
@@ -369,6 +429,8 @@ end
 -- ------------------------------------------------------------
 
 local function init()
+    load_config()
+
     SCREEN_W    = LCD_W or 128
     SCREEN_H    = LCD_H or 64
 
@@ -484,12 +546,13 @@ local function background()
         end
     end
 
-    if telemetry_live and curr > stats.max_current then
-        stats.max_current = curr
-    end
-
-    if telemetry_live and Capa > stats.mahdrain then
-        stats.mahdrain = Capa
+    if telemetry_live then
+        if curr > stats.max_current then
+            stats.max_current = curr
+        end
+        if Capa > stats.mahdrain then
+            stats.mahdrain = Capa
+        end
     end
 
     -- --- Battery ---
@@ -500,7 +563,7 @@ local function background()
 
     bat_state.cell_voltage = bat_state.cells > 0 and (bat_state.rx_bt / bat_state.cells) or 0
 
-    if bat_state.cells > 0 and bat_state.cell_voltage > 0 then
+    if bat_state.cells > 0 then
         if stats.min_voltage == 0 or bat_state.cell_voltage < stats.min_voltage then
             stats.min_voltage = bat_state.cell_voltage
         end
@@ -560,7 +623,7 @@ local function draw_bat_page(blink_on)
     lcd_drawText(SCREEN_W, LAYOUT.bat_label_y, BASE_TEXTS.cells, SMLSIZE + RIGHT)
     lcd_drawText(SCREEN_CENTER_X, LAYOUT.bat_label_y, bcfg.text, SMLSIZE + CENTER)
 
-    local cell_voltage_alert = (BATTERY_ALERT_ENABLED and bat_state.cells > 0 and bat_state.cell_voltage > 0 and bat_state.cell_voltage < bat_state.threshold)
+    local cell_voltage_alert = (BATTERY_ALERT_ENABLED and bat_state.cells > 0 and bat_state.cell_voltage < bat_state.threshold)
 
     if bat_state.cells > 0 then
         local volt_flags = SMLSIZE
@@ -623,6 +686,47 @@ local function draw_tot_page()
     lcd_drawText(0, LAYOUT.tot_line4_y, tot_strs.l4_left, SMLSIZE)
 end
 
+local function draw_cfg_page(blink_on)
+    local cw = SCREEN_W - 10
+    local ch = SCREEN_H - 10
+    if cw > 180 then cw = 180 end
+    if ch > 60 then ch = 60 end
+    local cx = math_floor((SCREEN_W - cw) / 2)
+    local cy = math_floor((SCREEN_H - ch) / 2)
+
+    lcd_drawFilledRect(cx, cy, cw, ch, ERASE or 0)
+    lcd_drawRect(cx, cy, cw, ch, SOLID)
+
+    local txt_y = cy + 4
+    local sh = 10
+
+    local items = {
+        { label = "UPDATE RATE", val = string_fmt("%.1fs", UPDATE_RATE / 100),            is_bool = false },
+        { label = "BAT ALERT",   val = BATTERY_ALERT_ENABLED and "ON" or "OFF",           is_bool = true },
+        { label = "AUDIO",       val = BATTERY_ALERT_AUDIO and "ON" or "OFF",             is_bool = true },
+        { label = "ALERT INT.",  val = string_fmt("%.0fs", BATTERY_ALERT_INTERVAL / 100), is_bool = false },
+        { label = "ALERT STEP",  val = string_fmt("-%.2fv", BATTERY_ALERT_STEP),          is_bool = false }
+    }
+
+    for i = 1, #items do
+        local flags_label = SMLSIZE
+        local flags_val = SMLSIZE + RIGHT
+
+        if i == cfg_sel then
+            if cfg_edit then
+                if blink_on then flags_val = flags_val + INVERS end
+            else
+                flags_label = flags_label + INVERS
+                flags_val = flags_val + INVERS
+            end
+        end
+
+        lcd_drawText(cx + 4, txt_y, items[i].label, flags_label)
+        lcd_drawText(cx + cw - 4, txt_y, items[i].val, flags_val)
+        txt_y = txt_y + sh
+    end
+end
+
 local last_blink_state = false
 
 -- ------------------------------------------------------------
@@ -631,6 +735,64 @@ local last_blink_state = false
 local function run(event)
     if event ~= 0 then
         force_redraw = true
+
+        -- Telemetry button check (short press = 108 on this radio)
+        if event == 108 then
+            show_cfg = not show_cfg
+            if not show_cfg then
+                cfg_edit = false  -- auto-exit edit mode
+                if cfg_changed then
+                    save_config() -- save changes to SD card
+                    cfg_changed = false
+                end
+            end
+            return 0
+        end
+
+        -- Block all other events until toggled off, but allow navigation
+        if show_cfg then
+            if not cfg_edit then
+                if event == EVT_ROT_RIGHT or event == EVT_PLUS_FIRST then
+                    cfg_sel = cfg_sel % 5 + 1
+                elseif event == EVT_ROT_LEFT or event == EVT_MINUS_FIRST then
+                    cfg_sel = (cfg_sel - 2 + 5) % 5 + 1
+                elseif event == EVT_ENTER_BREAK then
+                    cfg_edit = true
+                end
+            else
+                -- In edit mode
+                if event == EVT_ENTER_BREAK or event == EVT_RTN_FIRST then
+                    cfg_edit = false
+                elseif event == EVT_ROT_RIGHT or event == EVT_PLUS_FIRST then
+                    cfg_changed = true
+                    if cfg_sel == 1 then
+                        UPDATE_RATE = math_min(500, UPDATE_RATE + 10)
+                    elseif cfg_sel == 2 then
+                        BATTERY_ALERT_ENABLED = not BATTERY_ALERT_ENABLED
+                    elseif cfg_sel == 3 then
+                        BATTERY_ALERT_AUDIO = not BATTERY_ALERT_AUDIO
+                    elseif cfg_sel == 4 then
+                        BATTERY_ALERT_INTERVAL = math_min(10000, BATTERY_ALERT_INTERVAL + 100)
+                    elseif cfg_sel == 5 then
+                        BATTERY_ALERT_STEP = math_min(1.0, BATTERY_ALERT_STEP + 0.05)
+                    end
+                elseif event == EVT_ROT_LEFT or event == EVT_MINUS_FIRST then
+                    cfg_changed = true
+                    if cfg_sel == 1 then
+                        UPDATE_RATE = math_max(10, UPDATE_RATE - 10)
+                    elseif cfg_sel == 2 then
+                        BATTERY_ALERT_ENABLED = not BATTERY_ALERT_ENABLED
+                    elseif cfg_sel == 3 then
+                        BATTERY_ALERT_AUDIO = not BATTERY_ALERT_AUDIO
+                    elseif cfg_sel == 4 then
+                        BATTERY_ALERT_INTERVAL = math_max(0, BATTERY_ALERT_INTERVAL - 100)
+                    elseif cfg_sel == 5 then
+                        BATTERY_ALERT_STEP = math_max(0.05, BATTERY_ALERT_STEP - 0.05)
+                    end
+                end
+            end
+            return 0
+        end
 
         if event == EVT_ROT_RIGHT or event == EVT_PLUS_BREAK then
             current_page = current_page % #TABS + 1
@@ -658,7 +820,7 @@ local function run(event)
 
     -- --- Audio and alarms ---
     local current_time = getTime()
-    if BATTERY_ALERT_ENABLED and bat_state.cells > 0 and bat_state.cell_voltage > 0 then
+    if BATTERY_ALERT_ENABLED and bat_state.cells > 0 then
         if bat_state.cell_voltage < bat_state.threshold then
             if bat_state.alert_volt == 0 or
                 (current_time - bat_state.alert_time >= BATTERY_ALERT_INTERVAL and bat_state.alert_volt - bat_state.cell_voltage >= BATTERY_ALERT_STEP) then
@@ -696,6 +858,10 @@ local function run(event)
         draw_gps_page(blink_on)
     elseif current_page == 3 then
         draw_tot_page()
+    end
+
+    if show_cfg then
+        draw_cfg_page(blink_on)
     end
 
     -- Unified message system (Toast)

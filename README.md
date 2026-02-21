@@ -1,4 +1,4 @@
-# RCIC (RC Info Center) - A Telemetry Dashboard for EdgeTX
+# RCIC (RC Info Center) - Telemetry Dashboard for EdgeTX
 
 **RC Info Center (RCIC)** is a lightweight, fast, and highly optimized telemetry script designed for radio transmitters running **EdgeTX 2.9 or higher** (and compatible OpenTX). It provides a multifunctional tabbed dashboard, real-time configurable battery alerts, GPS coordinate validation, and fast Plus Code generation for location tracking.
 
@@ -6,7 +6,6 @@
 
 *(c) 2026 Alonso Lara.*
 
-![Version](https://img.shields.io/badge/Version-2.0-yellow)
 ![RC Info Center](https://img.shields.io/badge/EdgeTX-2.9%2B-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
@@ -17,8 +16,9 @@
 - **3-Tab Interface (BAT, GPS, TOT):** Quick and smooth navigation between Battery info, GPS Navigation Data, and Total Flight Statistics.
 - **Automatic Multilanguage:** Intelligently detects the transmitter's language (Support for Spanish, English, French, German, Italian, Portuguese, Russian, Polish, Czech, and Japanese).
 - **Integrated Configuration Menu:** Allows adjusting telemetry parameters directly from the transmitter without having to edit the source code via a visual overlay panel.
+- **On-Screen Local QR Code Generator:** Instantly builds a standard Version 2 `geo:` format QR Code from your current coordinates (6-decimal precision) natively in Lua without external libraries, scannable by any smartphone camera.
 - **"Plus Codes" Generation:** Converts your GPS coordinates into a short [Plus Code](https://maps.google.com/pluscodes/), making it easier to share exact locations if you need to recover your aircraft (even without a map visible on the radio).
-- **Optimized Performance:** Minimal CPU and memory usage (Reduced Garbage Collection through variable and string pre-allocation, plus efficient mathematical distance calculation), ensuring your radio always responds instantly and without "lag".
+- **Optimized Performance:** Minimal CPU and memory usage (Reduced Garbage Collection through static QR masks and variable pre-allocation, plus efficient mathematical distance calculation), ensuring your radio always responds instantly and without "lag".
 - **Smart Battery Alerts:** Blinking visual notifications and configurable voice alerts (with exact numerical voltage readouts) to prevent draining the battery beyond its safe zone. Features LiPo, LiHV, and LiIon profiles.
 
 ---
@@ -52,7 +52,8 @@ The main screen focused on monitoring the propulsion system.
 </p>
 
 Main coordinate visualizer if you are equipping your model with a GNSS/GPS module.
-- **Lat / Lon Coordinates:** Pure and readable exposure of absolute Latitude and Longitude.
+- **Lat / Lon Coordinates:** Pure and readable exposure of absolute Latitude and Longitude with up to 6 decimals, properly aligned.
+- **Dynamic QR Code:** Rendered simultaneously on the left side of the screen. This is generated locally (pure math) by the EdgeTX controller without relying on internet access. Scanning it with an Android/iOS smartphone immediately opens Google Maps/Apple Maps to the exact recovery location (`geo:lat,lon` RFC 5870 standard). Highly optimized using pre-calculated Bitmasks to avoid RAM overhead.
 - **GPS Signal Detail:** Always reports the number of locked satellites (`SAT`) and even displays the current altitude (`ALT`). Flashes "WAITING GPS" if the configured minimum satellites fail to create a 3D tracking space fix.
 - **Plus Code URL:** A text encoded under the Google `+CODE XXXX+XX` standard to quickly transcribe it to a mobile phone or map in a craft rescue without a live internet connection on the controller.
 - **Loss Protection (LOST):** If a generalized feed drop occurs in mid-flight and the frame jump fails (telemetry crashes or radio signal turns off), the screen will start drawing thick bounding boxes on all sides of the frame, storing the last traces in memory over any other window, thus guaranteeing a foolproof backup.
@@ -62,7 +63,7 @@ Main coordinate visualizer if you are equipping your model with a GNSS/GPS modul
 
 <p align="center">
    <img src="https://github.com/user-attachments/files/25457929/TOT1.bmp" width="128" height="64">
-</p>
+</p
 
 Dedicated to the historical recording and end of flight, it is where everything is accumulated in memory. Displays the pairing of the minimum / maximum timestamps captured without restarting.
 - **MIN V (Minimum Voltage):** Maintenance of the worst-case scenario *sag* reading.
@@ -80,10 +81,6 @@ Dedicated to the historical recording and end of flight, it is where everything 
 
 Instead of requiring constantly connecting your USB cable to the computer or employing cumbersome native LUA menus, the key that launches telemetry on the primary screen (usually a *long press* of the **[TELE]** button) will centrally invoke a native setup menu for RCIC that overlays the ongoing graphical display action.
 
-<p align="center">
-   <img src="https://github.com/user-attachments/files/25460855/CFG1.bmp" width="128" height="64">
-</p>
-
 To cycle or close, press the same invocation key. The interactable data of the setup box are the following:
 1. **UPDATE RATE:** Recalculation module/thousandths (chronological axes / `x ms`); the smaller it is, the more CPU load it demands, the higher the less sensitive but smoother the machine.
 2. **BAT ALERT:** Toggle to turn on/off (`ON/OFF`) any visual/auditory battery sink alert algorithm (useful in simulators/testing).
@@ -91,7 +88,7 @@ To cycle or close, press the same invocation key. The interactable data of the s
 4. **ALERT INT. (Alarm Intervention):** Timed pause between chants so as not to incessantly saturate your radio's auditory buffer if it rises or falls with the wind or aggressive aileron use.
 5. **ALERT STEP:** Constant voltage decay between repetitions. For example; a *Step* set to `.10v` indicates the transmitter to sing your voltage by voice only if your battery descends an extra static total with respect to the past warning (e.g.: dropped to "3.61v", warn. It will sing a drop again only when it reads \~"3.51v" or less).
 
-> *Use within Configuration Mode:* Move the cursor with **[+]** and **[-]**. When you want to change a specific value, press **[ENTER]**, noting that the inverted text will jump from the category to the value itself. There you rotate to define the amount in numbers, then you use **[ENTER]** or the return button **[RTN]** again. Closing this final menu ([TELE] key), we trigger a persistent micro-level safeguard on your SD card (creates a small text file in `/SCRIPTS/TELEMETRY/rcic.cfg`). You can now safely turn off the controller, all parameters will be identical tomorrow.
+> 💡 *Use within Configuration Mode:* Move the cursor with **[+]** and **[-]**. When you want to change a specific value, press **[ENTER]**, noting that the inverted text will jump from the category to the value itself. There you rotate to define the amount in numbers, then you use **[ENTER]** or the return button **[RTN]** again. Closing this final menu ([TELE] key), we trigger a persistent micro-level safeguard on your SD card (creates a small text file in `/SCRIPTS/TELEMETRY/rcic.cfg`). You can now safely turn off the controller, all parameters will be identical tomorrow.
 
 ---
 

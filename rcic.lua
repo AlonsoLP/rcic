@@ -1,7 +1,7 @@
 -- =========================================================================
 -- rcic.lua — RC Info Center
 --
--- Version:     2.0
+-- Version:     2.1
 -- Date:        2026-02-21
 -- Author:      Alonso Lara (github.com/AlonsoLP)
 -- Description: Lightweight telemetry dashboard for EdgeTX 2.9+ with
@@ -224,7 +224,8 @@ local gps_state         = {
     plus_code_url = "",
     lat_str       = "0.000000",
     lon_str       = "0.000000",
-    sats          = 0
+    sats          = 0,
+    qr_cache      = nil
 }
 
 local last_update_time  = 0
@@ -424,11 +425,116 @@ local function format_dist(meters)
     return meters >= 1000 and string_fmt("%.2fkm", meters / 1000) or string_fmt("%.0fm", meters)
 end
 
+-- V2 L QR Code Generator (25x25)
+local qr_e, qr_l = nil, nil
+local qr_b = {}
+local qr_m = {}
+local qr_ec = {}
+-- Pattern: {val, mask}
+local qr_base = {
+    { 0x1fc007f, 0x1fe01ff }, { 0x1040041, 0x1fe01ff }, { 0x174015d, 0x1fe01ff }, { 0x174005d, 0x1fe01ff },
+    { 0x174005d, 0x1fe01ff }, { 0x1040041, 0x1fe01ff }, { 0x1fd557f, 0x1ffffff }, { 0x0000100, 0x1fe01ff },
+    { 0x04601f7, 0x1fe01ff }, { 0x0000000, 0x0000040 }, { 0x0000040, 0x0000040 }, { 0x0000000, 0x0000040 },
+    { 0x0000040, 0x0000040 }, { 0x0000000, 0x0000040 }, { 0x0000040, 0x0000040 }, { 0x0000000, 0x0000040 },
+    { 0x01f0040, 0x01f0040 }, { 0x0110100, 0x01f01ff }, { 0x015017f, 0x01f01ff }, { 0x0110141, 0x01f01ff },
+    { 0x01f015d, 0x01f01ff }, { 0x000005d, 0x00001ff }, { 0x000015d, 0x00001ff }, { 0x0000141, 0x00001ff },
+    { 0x000017f, 0x00001ff }
+}
+local qr_gen = { 59, 13, 104, 189, 68, 209, 30, 8, 163, 65, 41, 229, 98, 50, 36, 59 }
+
+local function generate_qrv2(lat, lon)
+    if not bit32 then return nil end
+
+    local t = string_fmt("geo:%.6f,%.6f", lat, lon)
+    local bi = 0
+    local function pb(v, c)
+        for i = c - 1, 0, -1 do
+            qr_b[bi] = bit32.band(bit32.rshift(v, i), 1)
+            bi = bi + 1
+        end
+    end
+
+    pb(4, 4)
+    pb(#t, 8)
+    for i = 1, #t do pb(string.byte(t, i), 8) end
+    pb(0, 4)
+    while bi % 8 ~= 0 do pb(0, 1) end
+    local pad, pi = { 236, 17 }, 0
+    while bi < 224 do
+        pb(pad[pi % 2 + 1], 8)
+        pi = pi + 1
+    end
+
+    for i = 0, 27 do
+        local acc = 0
+        for j = 0, 7 do acc = bit32.lshift(acc, 1) + qr_b[i * 8 + j] end
+        qr_m[i + 1] = acc
+    end
+
+    for i = 1, 16 do qr_ec[i] = 0 end
+    for i = 1, 28 do
+        local f = bit32.bxor(qr_m[i], qr_ec[1])
+        for j = 1, 15 do qr_ec[j] = qr_ec[j + 1] end
+        qr_ec[16] = 0
+        if f ~= 0 then
+            local lf = qr_l[f]
+            for j = 1, 16 do qr_ec[j] = bit32.bxor(qr_ec[j], qr_e[(lf + qr_l[qr_gen[j]]) % 255]) end
+        end
+    end
+
+    for i = 1, 16 do
+        for j = 7, 0, -1 do
+            qr_b[bi] = bit32.band(bit32.rshift(qr_ec[i], j), 1)
+            bi = bi + 1
+        end
+    end
+    for i = 1, 7 do
+        qr_b[bi] = 0
+        bi = bi + 1
+    end
+
+    local res = {}
+    for r = 0, 24 do res[r + 1] = qr_base[r + 1][1] end
+
+    local cx, cy, dir, bd = 24, 24, -1, 0
+    while cx >= 0 do
+        if cx == 6 then cx = cx - 1 end
+        for _ = 1, 25 do
+            for col = 0, 1 do
+                local nx = cx - col
+                if bit32.band(qr_base[cy + 1][2], bit32.lshift(1, nx)) == 0 then
+                    local bit = qr_b[bd]
+                    bd = bd + 1
+                    if (cy + nx) % 2 == 0 then bit = bit32.bxor(bit, 1) end
+                    if bit == 1 then res[cy + 1] = bit32.bor(res[cy + 1], bit32.lshift(1, nx)) end
+                end
+            end
+            cy = cy + dir
+        end
+        cy = cy - dir
+        dir = -dir
+        cx = cx - 2
+    end
+    return res
+end
+
 -- ------------------------------------------------------------
 -- 8. INIT FUNCTION
 -- ------------------------------------------------------------
 
 local function init()
+    if bit32 and not qr_e then
+        qr_e, qr_l = {}, {}
+        local x = 1
+        for i = 0, 254 do
+            qr_e[i] = x
+            qr_l[x] = i
+            x = x * 2
+            if x > 255 then x = bit32.bxor(x, 285) end
+        end
+        qr_e[255] = qr_e[0]
+    end
+
     load_config()
 
     SCREEN_W    = LCD_W or 128
@@ -523,6 +629,7 @@ local function background()
             gps_state.plus_code_url = "+CODE " .. gps_state.plus_code
             gps_state.lat_str = string_fmt("%.6f", cur_lat)
             gps_state.lon_str = string_fmt("%.6f", cur_lon)
+            gps_state.qr_cache = generate_qrv2(cur_lat, cur_lon)
 
             if gps_state.fix then
                 local d = fast_dist(gps_state.lat, gps_state.lon, cur_lat, cur_lon)
@@ -660,15 +767,29 @@ local function draw_gps_page(blink_on)
     end
 
     if gps_state.fix then
-        lcd_drawText(SCREEN_CENTER_X, LAYOUT.coord_lat_y,
-            gps_state.lat_str, FONT_COORDS + CENTER)
-        lcd_drawText(SCREEN_CENTER_X, LAYOUT.coord_lon_y,
-            gps_state.lon_str, FONT_COORDS + CENTER)
+        lcd_drawText(SCREEN_W - 9, LAYOUT.coord_lat_y,
+            gps_state.lat_str, FONT_COORDS + RIGHT)
+        lcd_drawText(SCREEN_W - 9, LAYOUT.coord_lon_y,
+            gps_state.lon_str, FONT_COORDS + RIGHT)
 
         lcd_drawText(SCREEN_CENTER_X, LAYOUT.info_y, gps_str_info, FONT_INFO + CENTER)
 
         lcd_drawText(SCREEN_CENTER_X, LAYOUT.url_y,
             gps_state.plus_code_url, FONT_INFO + CENTER)
+
+        if gps_state.qr_cache then
+            -- Background: SOLID (is white on dark themes)
+            lcd_drawFilledRect(7, LAYOUT.coord_lat_y - 2, 29, 29, SOLID)
+            for r = 0, 24 do
+                local row_bits = gps_state.qr_cache[r + 1]
+                for c = 0, 24 do
+                    if bit32.band(row_bits, bit32.lshift(1, c)) ~= 0 then
+                        -- Dots: ERASE (is black on dark themes)
+                        lcd_drawFilledRect(9 + c, LAYOUT.coord_lat_y + r, 1, 1, ERASE or 0)
+                    end
+                end
+            end
+        end
     else
         lcd_drawText(SCREEN_CENTER_X, LAYOUT.waiting_y, BASE_TEXTS.waiting, FONT_COORDS + CENTER)
         lcd_drawText(SCREEN_CENTER_X, LAYOUT.sats_y,

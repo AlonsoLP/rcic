@@ -1,7 +1,7 @@
 -- =========================================================================
 -- rcic.lua — RC Info Center
 --
--- Version:     2.12
+-- Version:     2.13
 -- Date:        2026-02-21
 -- Author:      Alonso Lara (github.com/AlonsoLP)
 -- Description: Lightweight telemetry dashboard for EdgeTX 2.9+ with
@@ -625,6 +625,11 @@ local function init()
         qr_e[255] = qr_e[0]
     end
 
+    LANG = detect_language()
+    if LANG_OVERRIDES[LANG] then
+        for k, v in pairs(LANG_OVERRIDES[LANG]) do BASE_TEXTS[k] = v end
+    end
+
     load_config()
 
     SCREEN_W    = LCD_W or 128
@@ -672,11 +677,6 @@ local function init()
         local x = (i - 1) * TAB_W
         local w = (i == #TABS) and (SCREEN_W - x) or TAB_W
         TABS_LAYOUT[i] = { name = TABS[i], x = x, w = w, centerText_x = x + math_floor(w / 2) }
-    end
-
-    LANG = detect_language()
-    if LANG_OVERRIDES[LANG] then
-        for k, v in pairs(LANG_OVERRIDES[LANG]) do BASE_TEXTS[k] = v end
     end
 end
 

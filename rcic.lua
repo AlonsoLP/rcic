@@ -1,8 +1,8 @@
 -- =========================================================================
 -- rcic.lua — RC Info Center
 --
--- Version: 3.0
--- Date:    2026-03-17
+-- Version: 3.1
+-- Date:    2026-03-18
 -- Author:  Alonso Lara (github.com/AlonsoLP)
 --
 -- Description:
@@ -13,7 +13,7 @@
 --   support (es/en/fr/de/it/pt/ru/pl/cz/jp), persistent config via SD card,
 --   and touch-screen tab navigation for compatible radios.
 --
--- Compatibility: EdgeTX 2.9+ | Lua 5.3 | B&W and colour screens
+-- Compatibility: EdgeTX 2.9+ | Lua 5.3
 -- License:       MIT — see full text below
 --
 -- -------------------------------------------------------------------------
@@ -53,6 +53,7 @@ local TX_BAT_WARN            = 0      -- visual TX low-voltage warning
 local USE_IMPERIAL           = false
 local TOAST_DURATION         = 100    -- centiseconds = 1.5 seconds
 local MIN_SATS               = 4      -- minimum satellites required to accept a GPS fix
+local HAPTIC                 = false  -- enables vibration pulses on supported radios
 
 -- ------------------------------------------------------------
 -- 2. CONSTANTS AND INTERNAL CONFIGURATION
@@ -61,9 +62,18 @@ local CENTISECS_PER_SEC = 100
 local GPS_MAX_JUMP      = 5000  -- metres; filters impossible GPS teleport jumps
 local LOC_BEEP_MAX_CS   = 200
 local LOC_BEEP_MIN_CS   = 20
+
+-- LOC signal segmentation boundaries (dBm, negative).
+-- ELRS reports antenna RSSI in dBm; typical range is -15 (strong) to -115 (lost).
+-- LOC_SEG_NEAR: at or above this value the bar reads 100%.
+-- LOC_SEG_FAR : at or below this value the bar is clamped to 10% (never 0%,
+--               to distinguish "weak signal" from "no signal").
 local LOC_SEG_NEAR      = -15   -- & up: 100%
 local LOC_SEG_FAR       = -70   -- & below: 10%
 
+-- Each chemistry entry defines the per-cell voltage window used for
+-- % estimation and alert threshold. v_range = v_max - v_min; stored
+-- explicitly to avoid repeated subtraction in hot draw paths.
 local BAT_CONFIG = {
     { text = "LiPo",  volt = 3.5, v_max = 4.2,  v_min = 3.2, v_range = 1.0  },
     { text = "LiHV",  volt = 3.6, v_max = 4.35, v_min = 3.2, v_range = 1.15 },
@@ -80,8 +90,6 @@ local SENSOR_MAP = {
     gspd = { "GSpd"                },
     curr = { "Curr"                },
     vspd = { "VSpd"                },
-    fm   = { "FM"                  },
-    arm  = { "Arm"                 },
     loc  = { "1RSS", "2RSS", "RSSI"},
 }
 
@@ -111,7 +119,7 @@ local getValue           = getValue
 local playNumber         = playNumber
 local EVT_TOUCH_FIRST    = EVT_TOUCH_FIRST   -- nil on non-touch radios
 
-local ERASE_FLAG         = ERASE or 0
+local ERASE_FLAG         = ERASE or 0  -- ERASE may be nil on monochrome radios; 0 = safe no-op fallback
 
 -- ------------------------------------------------------------
 -- 3. SCREEN AND FONT DETECTION
@@ -148,21 +156,22 @@ local BASE_TEXTS        = {
     tab_bat   = "BAT",
     tab_gps   = "GPS",
     tab_tot   = "TOT",
-    cfg_rate  = "UPDATE RATE",
-    cfg_alert = "BAT ALERT",
-    cfg_audio = "AUDIO",
-    cfg_int   = "ALERT INT.",
-    cfg_step  = "ALERT STEP",
+    tab_loc   = "LOC",
+    cfg_rate  = "Update Rate",
+    cfg_alert = "Battery Alert",
+    cfg_audio = "Audio Alert",
+    cfg_int   = "Alert Interval",
+    cfg_step  = "Alert Step",
     cfg_on    = "ON",
     cfg_off   = "OFF",
-    cfg_sag   = "SAG LIMIT",
-    cfg_tx_warn = "TX ALERT",
+    cfg_sag   = "Sag Limit",
+    cfg_tx_warn = "TX Alert",
+    cfg_toast = "Toast Time",
+    cfg_capacity = "Battery MAH",
+    cfg_minsats = "Min Sats",
+    cfg_haptic = "Haptic",
     flt_time  = "FLT",
     min_lq    = "MIN LQ",
-    cfg_toast = "TOAST TIME",
-    cfg_capacity = "BAT MAH",
-    cfg_minsats = "MIN SATS",
-    tab_loc   = "LOC",
     loc_start = "ENTER: START",
     loc_dynpwr1 = "Best results obtained if",
     loc_dynpwr2 = "disable TX Dynamic Power",
@@ -178,15 +187,16 @@ local LANG_OVERRIDES    = {
         mahdrain  = "CONS",
         shot      = "CAPTURA",
         resetted  = "REINICIO",
-        cfg_rate  = "ACTUALIZAR",
-        cfg_alert = "ALERTA BAT",
-        cfg_int   = "INT. ALERTA",
-        cfg_step  = "SALTO ALERTA",
+        cfg_rate  = "Actualizar",
+        cfg_alert = "Alerta Bat",
+        cfg_int   = "Interv. Alerta",
+        cfg_step  = "Salto Alerta",
         cfg_on    = "SI",
         cfg_off   = "NO",
-	cfg_tx_warn = "ALERTA TX",
+	cfg_tx_warn = "Alerta TX",
+	cfg_toast = "T. Aviso",
+	cfg_haptic = "Haptico",
 	flt_time  = "VUELO",
-	cfg_toast = "T. AVISO",
     },
     fr = {
         waiting   = "ATTENTE GPS",
@@ -195,15 +205,16 @@ local LANG_OVERRIDES    = {
         max_spd   = "VIT MAX",
         mahdrain  = "CONS",
         shot      = "CAPTURE",
-        cfg_rate  = "RAFRAICHIR",
-        cfg_alert = "ALERTE BAT",
-        cfg_int   = "INT. ALERTE",
-        cfg_step  = "SAUT ALERTE",
+        cfg_rate  = "Rafraichir",
+        cfg_alert = "Alerte Bat",
+        cfg_int   = "Interv. Alerte",
+        cfg_step  = "Saut Alerte",
         cfg_on    = "OUI",
         cfg_off   = "NON",
-	cfg_tx_warn = "ALERTE TX",
+	cfg_tx_warn = "Alerte TX",
+	cfg_toast = "T. Notif",
+	cfg_haptic = "Haptique",
 	flt_time  = "VOL",
-	cfg_toast = "T. NOTIF",
     },
     de = {
         waiting   = "WARTE GPS",
@@ -217,16 +228,17 @@ local LANG_OVERRIDES    = {
         shot      = "FOTO",
         tab_bat   = "AKK",
         tab_tot   = "GES",
-        cfg_rate  = "RATE",
-        cfg_alert = "AKKU ALARM",
-        cfg_int   = "ALARM INT.",
-        cfg_step  = "ALARM STEP",
+        cfg_rate  = "Rate",
+        cfg_alert = "Akku Alarm",
+        cfg_int   = "Alarm Interv.",
+        cfg_step  = "Alarm Step",
         cfg_on    = "EIN",
         cfg_off   = "AUS",
-	cfg_sag   = "SAG GRENZ",
+	cfg_sag   = "Sag Grenz",
+	cfg_toast = "Meld Zeit",
+	cfg_capacity = "Akk MAH",
+	cfg_haptic = "Haptik",
 	flt_time  = "FLUG",
-	cfg_toast = "MELD ZEIT",
-	cfg_capacity = "AKK MAH",
     },
     it = {
         waiting   = "ATTESA GPS",
@@ -237,15 +249,16 @@ local LANG_OVERRIDES    = {
         max_cur   = "COR MAX",
         mahdrain  = "CONS",
         shot      = "CATTURA",
-        cfg_rate  = "AGGIORNA",
-        cfg_alert = "ALLARME BAT",
-        cfg_int   = "INT. ALL.",
-        cfg_step  = "STEP ALL.",
+        cfg_rate  = "Aggiorna",
+        cfg_alert = "Allarme Bat",
+        cfg_int   = "Allarme Interv.",
+        cfg_step  = "Allarme Step",
         cfg_on    = "SI",
         cfg_off   = "NO",
-	cfg_tx_warn = "ALLARME TX",
+	cfg_tx_warn = "Allarme TX",
+	cfg_toast = "T. Avviso",
+	cfg_haptic = "Aptico",
 	flt_time  = "VOLO",
-	cfg_toast = "T. AVVISO",
     },
     pt = {
         waiting   = "AGUARDANDO",
@@ -255,15 +268,16 @@ local LANG_OVERRIDES    = {
         max_cur   = "COR MAX",
         mahdrain  = "CONS",
         shot      = "CAPTURA",
-        cfg_rate  = "TAXA ATUAL.",
-        cfg_alert = "ALERTA BAT",
-        cfg_int   = "INT. ALERTA",
-        cfg_step  = "PASSO ALERTA",
+        cfg_rate  = "Taxa Atual.",
+        cfg_alert = "Alerta Bat",
+        cfg_int   = "Interv. Alerta",
+        cfg_step  = "Passo Alerta",
         cfg_on    = "LIG",
         cfg_off   = "DES",
-	cfg_tx_warn = "ALERTA TX",
+	cfg_tx_warn = "Alerta TX",
+	cfg_toast = "T. Aviso",
+	cfg_haptic = "Haptico",
 	flt_time  = "VOO",
-	cfg_toast = "T. AVISO",
     },
     ru = {
         waiting   = "OZHID GPS",
@@ -280,19 +294,20 @@ local LANG_OVERRIDES    = {
         resetted  = "SBROS",
         tab_bat   = "AKB",
         tab_tot   = "VSE",
-        cfg_rate  = "OBNOVLENIE",
-        cfg_alert = "VTREV BAT",
-        cfg_audio = "ZVUK",
-        cfg_int   = "INT. TREV",
-        cfg_step  = "SHAG TREV",
+        cfg_rate  = "Obnovlenie",
+        cfg_alert = "Vtrev Bat",
+        cfg_audio = "Zvuk",
+        cfg_int   = "Interv. Trev",
+        cfg_step  = "Shag Trev",
         cfg_on    = "VK",
         cfg_off   = "VY",
-	cfg_sag   = "SAG POROG",
-        cfg_tx_warn = "TREV TX",
+	cfg_sag   = "Sag Porog",
+        cfg_tx_warn = "Trev TX",
+	cfg_toast = "Vr Soob",
+	cfg_capacity = "Akb MAH",
+	cfg_minsats = "Min Spt",
+	cfg_haptic = "Vibro",
 	flt_time  = "POLET",
-	cfg_toast = "VR SOOB",
-	cfg_capacity = "AKB MAH",
-	cfg_minsats = "MIN SPT",
     },
     pl = {
         waiting   = "SZUKAM GPS",
@@ -306,15 +321,16 @@ local LANG_OVERRIDES    = {
         shot      = "FOTO",
         tab_bat   = "AKU",
         tab_tot   = "SUM",
-        cfg_rate  = "ODSWIEZ",
-        cfg_alert = "ALARM BAT",
-        cfg_int   = "INT. ALARM",
-        cfg_step  = "KROK ALARM",
+        cfg_rate  = "Odswiez",
+        cfg_alert = "Alarm Bat",
+        cfg_int   = "Interw. Alarm",
+        cfg_step  = "Krok Alarm",
         cfg_on    = "WL",
         cfg_off   = "WYL",
+	cfg_toast = "Czas Pow",
+	cfg_capacity = "Aku MAH",
+	cfg_haptic = "Wibracja",
         flt_time  = "LOT",
-	cfg_toast = "CZAS POW",
-	cfg_capacity = "AKU MAH",
     },
     cz = {
         waiting   = "CEKAM GPS",
@@ -327,14 +343,15 @@ local LANG_OVERRIDES    = {
         mahdrain  = "SPOTR",
         shot      = "FOTKA",
         tab_tot   = "CEL",
-        cfg_rate  = "OBNOVA",
-        cfg_alert = "ALARM BAT",
-        cfg_int   = "INT. ALARM",
-        cfg_step  = "KROK ALARM",
+        cfg_rate  = "Obnova",
+        cfg_alert = "Alarm Bat",
+        cfg_int   = "Interv. Alarm",
+        cfg_step  = "Krok Alarm",
         cfg_on    = "ZAP",
         cfg_off   = "VYP",
+	cfg_toast = "Cas Zpr",
+	cfg_haptic = "Vibrace",
         flt_time  = "LET",
-	cfg_toast = "CAS ZPR",
     },
     jp = {
         waiting   = "GPS TAIKI",
@@ -349,16 +366,17 @@ local LANG_OVERRIDES    = {
         mahdrain  = "SHOHI",
         shot      = "SATSU",
         resetted  = "RISETTO",
-        cfg_rate  = "KOSHIN",
-        cfg_alert = "KEIHO",
-        cfg_audio = "ONSEI",
-        cfg_int   = "KEIHO INT",
-        cfg_step  = "KEIHO STEP",
-	cfg_sag   = "SAG AMP",
-	cfg_tx_warn = "TX KEIHO",
+        cfg_rate  = "Koshin",
+        cfg_alert = "Keiho",
+        cfg_audio = "Onsei",
+        cfg_int   = "Kehio Kankaku",
+        cfg_step  = "Keiho Step",
+	cfg_sag   = "Sag Amp",
+	cfg_tx_warn = "TX Keiho",
+	cfg_toast = "Hyoji Ji",
+	cfg_minsats = "Min Eis",
+	cfg_haptic = "Shindo",
 	flt_time  = "HIKO",
-	cfg_toast = "HYOJI JI",
-	cfg_minsats = "MIN EIS",
     },
 }
 
@@ -432,6 +450,8 @@ local _alt_factor       = 1.0
 local _spd_unit         = "kmh"
 local _spd_factor       = 1.0
 
+-- Displays a centered toast notification for TOAST_DURATION centiseconds.
+-- Recalculates width and position on every call to fit variable-length messages.
 local function show_toast(msg)
     toast_msg = msg
     toast_time = getTime()
@@ -459,31 +479,39 @@ local tot_strs = {
 local gps_str_info = ""
 local gps_sats_str = ""
 
-local CFG_KEYS = {"cfg_rate","cfg_alert","cfg_audio","cfg_int","cfg_step","cfg_sag","cfg_tx_warn","cfg_toast","cfg_capacity","cfg_minsats"}
+local CFG_KEYS = {"cfg_rate","cfg_alert","cfg_audio","cfg_int","cfg_step","cfg_sag","cfg_tx_warn","cfg_toast","cfg_capacity","cfg_minsats","cfg_haptic"}
 local cfg_items = {}
 
+-- Resets all flight statistics to their default zero values.
+-- Called on init and when the user triggers a manual reset from the TOT page.
 local function reset_stats()
     for k, v in pairs(STATS_DEFAULTS) do stats[k] = v end
 end
 reset_stats()
 
-local _s = {}              -- sensor names
-local _capa_is_pct = false -- true if Fuel (not Capa)
+-- sensor names
+local _s = {}
+
+-- true if Fuel (not Capa)
+local _capa_is_pct = false
 
 local cfg_scroll = 0
 
+-- fallback TX warning threshold when getGeneralSettings() provides no battWarn value
 local _bat_warn_default = 6.6
 
+-- true when LOC sensor resolves to 1RSS/2RSS (ELRS); selects segmented dBm scaling
 local _loc_is_elrs  = false
+
 local loc_active    = false
 local loc_next_play = 0
-local loc_haptic    = false
-local loc_sig       = nil
-local loc_sig_pct   = 0
-local loc_sig_prev  = nil
-local loc_tpwr      = nil
-local loc_sig_pct   = 0      -- visual/audio range adaptation
-local loc_sig_pct_r = 0      -- real values
+
+-- last raw signal value (dBm for ELRS, 0-100 for RSSI). nil = no sensor read.
+local loc_sig = nil
+-- TX power in mW from TPWR sensor; nil if sensor absent.
+local loc_tpwr = nil
+-- normalised 0-100 value driving bar fill, beep rate and haptic.
+local loc_sig_pct = 0
 
 -- ------------------------------------------------------------
 -- 7. UTILITY FUNCTIONS
@@ -500,21 +528,27 @@ local function refresh_cfg_vals()
     cfg_items[8].val  = string_fmt("%.1fs", TOAST_DURATION / 100)
     cfg_items[9].val  = string_fmt("%dmAh", BAT_CAPACITY_MAH)
     cfg_items[10].val = string_fmt("%d", MIN_SATS)
+    cfg_items[11].val = HAPTIC and BASE_TEXTS.cfg_on or BASE_TEXTS.cfg_off
 end
 
+-- Serialises all user-configurable settings to a CSV file on the SD card.
+-- Field order is fixed; see load_config() code for the mapping.
 local function save_config()
     local file = io.open(CFG_FILE, "w")
     if file then
-	io.write(file, string_fmt("%d,%d,%d,%d,%.2f,%d,%.1f,%d,%d,%d",
+	io.write(file, string_fmt("%d,%d,%d,%d,%.2f,%d,%.1f,%d,%d,%d,%d",
 	    UPDATE_RATE, BATTERY_ALERT_ENABLED and 1 or 0,
 	    BATTERY_ALERT_AUDIO and 1 or 0,
 	    BATTERY_ALERT_INTERVAL, BATTERY_ALERT_STEP,
 	    SAG_CURRENT_THRESHOLD, TX_BAT_WARN,
-	    TOAST_DURATION, BAT_CAPACITY_MAH, MIN_SATS))
+	    TOAST_DURATION, BAT_CAPACITY_MAH, MIN_SATS,
+	    HAPTIC and 1 or 0))
         io.close(file)
     end
 end
 
+-- Reads and parses the CSV config file from SD card, applying values to runtime vars.
+-- Missing or extra fields are silently ignored, preserving forward compatibility.
 local function load_config()
     local file = io.open(CFG_FILE, "r")
     if not file then return end
@@ -538,18 +572,23 @@ local function load_config()
     if n(8)  then TOAST_DURATION        = n(8)        end
     if n(9)  then BAT_CAPACITY_MAH      = n(9)        end
     if n(10) then MIN_SATS              = n(10)       end
+    if n(11) then HAPTIC                = n(11) == 1  end
 end
 
--- Infer cell count from pack voltage using chemistry-specific v_max.
--- The +0.05 V margin handles exact full-charge readings without
--- rounding up to the next cell count (e.g. 4S LiPo at 16.80 V).
+-- Uses v_max + 0.05 V as the per-cell ceiling instead of v_max to avoid
+-- misclassifying a freshly charged pack. Example: a 4S LiPo at 16.82 V
+-- divided by 4.20 gives 4.004 → floor = 4 correct, but at exactly 16.80 V
+-- divided by 4.20 gives exactly 4.000 → floor = 4 still correct.
+-- Without the margin, floating-point drift could produce 3.999 → floor = 3.
 local function detect_cells(voltage)
     if voltage < 0.5 then return 0 end
     -- +0.05 V margin per chemistry — LiPo: 4.25  LiHV: 4.40  LiIon: 4.25
     return math_floor(voltage / (BAT_CONFIG[bat_state.cfg_idx].v_max + 0.05)) + 1
 end
 
--- Rejects cold-start (0, 0) coordinates and out-of-range values.
+-- EdgeTX GPS sensor returns {lat=0, lon=0} before acquiring a fix.
+-- The (0,0) point is in the Gulf of Guinea; excluding it avoids
+-- plotting the drone at sea during cold start.
 local function is_valid_gps(lat, lon)
     return (lat ~= 0 or lon ~= 0) and
         lat >= -90 and lat <= 90 and lon >= -180 and lon <= 180
@@ -607,6 +646,7 @@ local function format_dist(meters)
         or  string_fmt("%.0fm",  meters)
 end
 
+-- Wraps a 1-based index cyclically within [1..n], stepping by dir (+1 or -1).
 local function cycle(val, n, dir) return (val - 1 + dir + n) % n + 1 end
 
 -- QR Code v2-L generator producing a 25×25 module matrix.
@@ -639,6 +679,20 @@ local qr_base = {
 -- Generator polynomial for QR v2-L (16 EC codewords, degree-16 over GF(256))
 local qr_gen = { 59, 13, 104, 189, 68, 209, 30, 8, 163, 65, 41, 229, 98, 50, 36, 59 }
 
+-- Encodes a "geo:lat,lon" URI as a QR Code version 2-L (25×25 modules,
+-- ~7% error correction). Version 2-L was chosen because:
+--   - "geo:±DD.DDDDDD,±DDD.DDDDDD" fits within the 28-byte data capacity.
+--   - Low EC level maximises data capacity; outdoor use does not need high EC.
+-- The matrix is written into the pre-allocated module-level qr_res[] table
+-- to avoid heap allocation on every GPS position update.
+-- GF(256) arithmetic uses the primitive polynomial x^8+x^4+x^3+x^2+1 (0x11D).
+-- qr_e[i] = alpha^i mod p(x)  — antilog / exponent table
+-- qr_l[v] = log_alpha(v)      — log table; undefined for v=0 (never accessed)
+-- Together they convert multiply/divide in GF(256) to table lookups + mod 255.
+-- Mask pattern 0: flip module when (row + col) % 2 == 0.
+-- QR spec requires at least one mask to be evaluated; pattern 0 is hardcoded
+-- here for simplicity since the payload has no periodic structure that would
+-- cause a score penalty.
 local function generate_qrv2(lat, lon)
     local t = string_fmt("geo:%.6f,%.6f", lat, lon)
     local bi = 0
@@ -721,13 +775,12 @@ local function generate_qrv2(lat, lon)
     return qr_res
 end
 
+-- Returns the raw signal value from the active LOC sensor, or nil if unavailable.
+-- Returns nil also when the sensor reads exactly 0 (no-signal sentinel value).
 local function loc_get_signal()
-    if not _s.loc then return nil, 0, 100 end
+    if not _s.loc then return nil end
     local v = getValue(_s.loc)
-    if _loc_is_elrs then
-        return (v == 0 and -115 or v), -115, 20
-    end
-    return v, 0, 100
+    return v ~= 0 and v or nil
 end
 
 -- ------------------------------------------------------------
@@ -789,7 +842,7 @@ local function init()
 
     -- Pre-compute all layout positions as absolute pixel coordinates to
     -- avoid repeated arithmetic inside the draw functions.
-    SCREEN_CENTER_X = SCREEN_W / 2
+    SCREEN_CENTER_X = math_floor(SCREEN_W / 2)
     TAB_H           = 9
     CONTENT_Y       = TAB_H + 1
     CONTENT_H       = SCREEN_H - CONTENT_Y
@@ -845,6 +898,9 @@ local function init()
     end
 end
 
+-- Probes all sensor candidates in SENSOR_MAP and caches the first responding name.
+-- Sets _loc_is_elrs true when the resolved LOC sensor is 1RSS/2RSS (ELRS link).
+-- Runs once after telemetry becomes live; resets _s._done on link loss to re-detect.
 local function detect_sensors()
     for key, candidates in pairs(SENSOR_MAP) do
         for _, name in ipairs(candidates) do
@@ -906,10 +962,17 @@ local function background()
 
 	if gps_state.sats >= MIN_SATS and is_valid_gps(cur_lat, cur_lon) then
 	    if gps_state.lat ~= cur_lat or gps_state.lon ~= cur_lon then
+		-- do_update gate: skip Plus Code and QR regeneration if the drone moved
+		-- less than 2 m. GPS sensors quantise to ~1 m; this prevents redundant
+		-- regeneration caused by LSB jitter on a stationary craft.
 		local do_update = not gps_state.fix
+
 		if gps_state.fix then
 		    local d = fast_dist(gps_state.lat, gps_state.lon, cur_lat, cur_lon)
+
+		    -- GPS_MAX_JUMP rejects teleport jumps (receiver glitch / reboot)
 		    if d < GPS_MAX_JUMP then stats.total_dist = stats.total_dist + d end
+
 		    do_update = d > 2.0
 		end
 		if do_update then
@@ -944,11 +1007,13 @@ local function background()
 	gps_state.prev_alt = alt
     end
 
-    -- Battery processing always runs: RxBt is available without a full telemetry link.
-    -- Re-detect cell count on voltage jumps > 1 V (battery swap or cold start).
-    if math_abs(bat_state.rx_bt - bat_state.last_volt) > 1.0 then
-        bat_state.cells = detect_cells(bat_state.rx_bt)
-    end
+    -- Cell count is re-inferred whenever pack voltage jumps more than 1 V.
+    -- This handles two cases:
+    --   1. Cold start: RxBt climbs from 0 V when the drone powers on.
+    --   2. Battery swap: pack voltage changes significantly mid-session.
+    -- A 1 V hysteresis avoids false re-detection from normal sag under load.
+    if math_abs(bat_state.rx_bt - bat_state.last_volt) > 1.0 then bat_state.cells = detect_cells(bat_state.rx_bt) end
+
     bat_state.last_volt    = bat_state.rx_bt
     bat_state.cell_voltage = bat_state.cells > 0 and (bat_state.rx_bt / bat_state.cells) or 0
 
@@ -1012,6 +1077,8 @@ end
 -- 10. DRAWING FUNCTIONS
 -- ------------------------------------------------------------
 
+-- Draws the tab headers at the top of the screen.
+-- Active tab uses filled background + inverted text; inactive tabs use border 
 local function draw_tabs()
     for i = 1, #TABS_LAYOUT do
         local tab = TABS_LAYOUT[i]
@@ -1027,6 +1094,7 @@ local function draw_tabs()
     end
 end
 
+-- Draws the BAT page
 local function draw_bat_page(blink_on)
     lcd_drawText(SCREEN_CENTER_X, LAYOUT.bat_value_y,
         bat_state.rx_fmt, DBLSIZE + CENTER)
@@ -1067,6 +1135,7 @@ local function draw_bat_page(blink_on)
     end
 end
 
+-- Draws the GPS page
 local function draw_gps_page(blink_on)
     if gps_state.fix and not telemetry_live and blink_on then
         lcd_drawRect(0, CONTENT_Y, SCREEN_W, LAYOUT.gps_lost_h, SOLID)
@@ -1099,6 +1168,7 @@ local function draw_gps_page(blink_on)
     end
 end
 
+-- Draws the TOT page
 local function draw_tot_page()
     lcd_drawText(0, LAYOUT.tot_line1_y, tot_strs.l1_left, SMLSIZE)
     lcd_drawText(SCREEN_W, LAYOUT.tot_line1_y, tot_strs.l1_right, SMLSIZE + RIGHT)
@@ -1111,6 +1181,7 @@ local function draw_tot_page()
     lcd_drawText(0, LAYOUT.tot_line5_y, tot_strs.l5_left,  SMLSIZE)
 end
 
+-- Draws the LOC page
 local function draw_loc_page(blink_on)
     if not loc_active then
         lcd_drawText(SCREEN_CENTER_X, LAYOUT.waiting_y, BASE_TEXTS.loc_start, FONT_COORDS + CENTER)
@@ -1124,10 +1195,6 @@ local function draw_loc_page(blink_on)
             BASE_TEXTS.loc_nosig, FONT_COORDS + CENTER + (blink_on and INVERS or 0))
         return
     end
-
-    local val_str = loc_tpwr
-	and string_fmt("%d dB %d%% %dmW", loc_sig, math_floor(loc_sig_pct), loc_tpwr)
-	or  string_fmt("%d dB  %d%%",     loc_sig, math_floor(loc_sig_pct))
 
     local dbl_y  = CONTENT_Y + 9
     local sml_y  = dbl_y + 6
@@ -1147,6 +1214,7 @@ local function draw_loc_page(blink_on)
     end
 end
 
+-- Draws the CFG overlay
 local function draw_cfg_page(blink_on)
     local cx, cy = LAYOUT.cfg_x, LAYOUT.cfg_y
     local cw, ch = LAYOUT.cfg_w, LAYOUT.cfg_h
@@ -1186,7 +1254,7 @@ local function run(event)
 
         -- Touch-screen tab navigation (TX16S, Boxer, and other touch-capable radios).
         -- EVT_TOUCH_FIRST is nil on button-only radios, so the outer guard is safe.
-	if EVT_TOUCH_FIRST and event == EVT_TOUCH_FIRST then
+	if EVT_TOUCH_FIRST and event == EVT_TOUCH_FIRST and not show_cfg then
 	    if getTouchState then
     		local touch = getTouchState()
     		if touch and touch.y <= TAB_H then
@@ -1213,6 +1281,14 @@ local function run(event)
 
         -- Block all other events until toggled off, but allow navigation
         if show_cfg then
+	    if event == EVT_EXIT_BREAK and not cfg_edit then
+    		show_cfg = false
+    		if cfg_changed then
+        	    save_config()
+        	    cfg_changed = false
+    		end
+    		return 0
+	    end
             if not cfg_edit then
 		if event == EVT_ROT_RIGHT or event == EVT_PLUS_FIRST then
 		    cfg_sel = cycle(cfg_sel, #cfg_items,  1)
@@ -1223,7 +1299,7 @@ local function run(event)
                 end
             else
                 -- In edit mode
-                if event == EVT_ENTER_BREAK or event == EVT_RTN_FIRST then
+                if event == EVT_ENTER_BREAK or event == EVT_EXIT_BREAK then
                     cfg_edit = false
 		elseif event == EVT_ROT_RIGHT or event == EVT_PLUS_FIRST or
     			event == EVT_ROT_LEFT  or event == EVT_MINUS_FIRST then
@@ -1249,6 +1325,8 @@ local function run(event)
 			BAT_CAPACITY_MAH = math_max(100, math_min(20000, BAT_CAPACITY_MAH + 100 * dir))
 		    elseif cfg_sel == 10 then
 			MIN_SATS = math_max(3, math_min(8, MIN_SATS + dir))
+		    elseif cfg_sel == 11 then
+			HAPTIC = not HAPTIC
 		    end
 		    refresh_cfg_vals()
                 end
@@ -1286,17 +1364,21 @@ local function run(event)
                 reset_stats()
 		show_toast(string_fmt("** %s **", BASE_TEXTS.resetted))
 	    elseif current_page == 4 then
-		if event == EVT_ENTER_BREAK then
-		    loc_active = not loc_active
-	            if not loc_active then loc_next_play = 0; loc_sig = nil end
-	        elseif (event == EVT_ROT_RIGHT or event == EVT_PLUS_FIRST) and loc_active then
-	            loc_haptic = not loc_haptic
-	        end
+		loc_active = not loc_active
+	        if not loc_active then loc_next_play = 0; loc_sig = nil end
             end
         end
     end
 
-    -- Battery alert logic
+    -- Battery alert logic. Two-tier re-alert logic:
+    --   Tier 1 (time): re-alert only after BATTERY_ALERT_INTERVAL centiseconds
+    --                  have elapsed since the last alert.
+    --   Tier 2 (step): re-alert only if voltage has dropped at least
+    --                  BATTERY_ALERT_STEP volts since the last alert.
+    -- Both conditions must be true simultaneously. This prevents spamming
+    -- alerts when voltage fluctuates around the threshold under sag.
+    -- SAG_CURRENT_THRESHOLD suppresses all alerts during high-current draws
+    -- where temporary voltage sag is expected and non-critical.
     local current_time = getTime()
     if BATTERY_ALERT_ENABLED and bat_state.cells > 0 and bat_state.curr <= SAG_CURRENT_THRESHOLD then
         if bat_state.cell_voltage < bat_state.threshold then
@@ -1316,7 +1398,8 @@ local function run(event)
         end
     end
 
-    -- 1 Hz blink clock: toggles every second, drives alert flash and signal-lost border
+    -- blink_on toggles at 1 Hz by testing bit 0 of (time / 100cs).
+    -- Redraws are forced on every state change to avoid stale frames.
     local blink_on = (math_floor(current_time / CENTISECS_PER_SEC) % 2) == 0
     if blink_on ~= last_blink_state then
         last_blink_state = blink_on
@@ -1332,27 +1415,33 @@ local function run(event)
     -- Locator
     if current_page == 4 and loc_active then
 	-- Signal Cache
-	local s, smin, smax = loc_get_signal()
+	local s = loc_get_signal()
 	local tpwr_raw = getFieldInfo("TPWR") and getValue("TPWR") or nil
 
+	-- ELRS uses segmented dBm scaling with two linear zones:
+	--   Zone 1 (noise floor → FAR): maps -115..LOC_SEG_FAR  → 0..10%
+	--   Zone 2 (FAR → near):        maps LOC_SEG_FAR..LOC_SEG_NEAR → 10..100%
+	-- The two-zone model gives higher resolution in the useful mid-range
+	-- while still showing movement at the extreme far end.
+	-- Non-ELRS links report 0-100 directly; no remapping needed.
 	if s then
-	    -- segmented: -115..-75 → 0..10% | -75..-15 → 10..100%
-	    if s >= LOC_SEG_NEAR then
-    		loc_sig_pct = 100
-	    elseif s <= LOC_SEG_FAR then
-    		loc_sig_pct = math_max(0, 10 * (s - (-115)) / (LOC_SEG_FAR - (-115)))
+	    if _loc_is_elrs then
+		-- segmented: -115..LOC_SEG_FAR = 0..10% | LOC_SEG_FAR..LOC_SEG_NEAR = 10..100%
+		if s >= LOC_SEG_NEAR then
+    		    loc_sig_pct = 100
+		elseif s <= LOC_SEG_FAR then
+    		    loc_sig_pct = math_max(0, 10 * (s - (-115)) / (LOC_SEG_FAR - (-115)))
+		else
+    		    loc_sig_pct = 10 + 90 * (s - LOC_SEG_FAR) / (LOC_SEG_NEAR - LOC_SEG_FAR)
+		end
 	    else
-    		loc_sig_pct = 10 + 90 * (s - LOC_SEG_FAR) / (LOC_SEG_NEAR - LOC_SEG_FAR)
+    		loc_sig_pct = math_max(0, math_min(100, s))
 	    end
-	    -- real % display
-	    local r_min = _loc_is_elrs and -115 or 0
-	    local r_max = _loc_is_elrs and  20  or 100
-	    loc_sig_pct_r = math_max(0, math_min(100, 100 * (s - r_min) / (r_max - r_min)))
 	else
 	    loc_sig_pct   = 0
-	    loc_sig_pct_r = 0
 	end
 
+	-- Force redraw only when signal or TX power actually changes.
 	if s ~= loc_sig or tpwr_raw ~= loc_tpwr then
     	    loc_sig   = s
     	    loc_tpwr  = tpwr_raw
@@ -1364,8 +1453,9 @@ local function run(event)
 	if now >= loc_next_play then
     	    if loc_sig then
         	playTone(math_floor(400 + loc_sig_pct * 6), 80, 0, PLAY_NOW)
-        	if loc_haptic and playHaptic then playHaptic(7, 0, 1) end
+        	if HAPTIC and playHaptic then playHaptic(7, 0, 1) end
     	    end
+	    -- interval shrinks linearly from LOC_BEEP_MAX_CS (weak signal) to LOC_BEEP_MIN_CS (strong signal)
     	    loc_next_play = now + math_floor(LOC_BEEP_MAX_CS - (LOC_BEEP_MAX_CS - LOC_BEEP_MIN_CS) * loc_sig_pct / 100)
 	end
     end

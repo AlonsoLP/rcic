@@ -1,8 +1,8 @@
 -- =========================================================================
 -- rcic.lua — RC Info Center
 --
--- Version: 3.1
--- Date:    2026-03-18
+-- Version: 3.2
+-- Date:    2026-03-20
 -- Author:  Alonso Lara (github.com/AlonsoLP)
 --
 -- Description:
@@ -42,6 +42,7 @@
 -- ------------------------------------------------------------
 -- 1. RUNTIME CONFIGURATION DEFAULTS
 -- ------------------------------------------------------------
+
 local UPDATE_RATE            = 100    -- centiseconds (100 = 1 s)
 local BATTERY_ALERT_ENABLED  = true   -- visual drone low-voltage warning
 local BATTERY_ALERT_AUDIO    = true
@@ -54,14 +55,20 @@ local USE_IMPERIAL           = false
 local TOAST_DURATION         = 100    -- centiseconds = 1.5 seconds
 local MIN_SATS               = 4      -- minimum satellites required to accept a GPS fix
 local HAPTIC                 = false  -- enables vibration pulses on supported radios
+local AUTO_TAB               = true   -- auto-switch to GPS/LOC tab on telemetry loss
+local ARM_SWITCH             = ""     -- arm switch name ("" = disabled)
+local ARM_VALUE              = 0      -- exact switch value captured during arm-listen
 
 -- ------------------------------------------------------------
 -- 2. CONSTANTS AND INTERNAL CONFIGURATION
 -- ------------------------------------------------------------
+
 local CENTISECS_PER_SEC = 100
 local GPS_MAX_JUMP      = 5000  -- metres; filters impossible GPS teleport jumps
+
 local LOC_BEEP_MAX_CS   = 200
 local LOC_BEEP_MIN_CS   = 20
+local LOC_BEEP_RANGE    = LOC_BEEP_MAX_CS - LOC_BEEP_MIN_CS  -- 180 cs
 
 -- LOC signal segmentation boundaries (dBm, negative).
 -- ELRS reports antenna RSSI in dBm; typical range is -15 (strong) to -115 (lost).
@@ -91,11 +98,46 @@ local SENSOR_MAP = {
     curr = { "Curr"                },
     vspd = { "VSpd"                },
     loc  = { "1RSS", "2RSS", "RSSI"},
+    fmode = { "FM",  "FMod"        },
+    tpwr  = { "TPWR"               },
 }
 
+local ARM_SW_LIST = {"SA","SB","SC","SD","SE","SF","SG","SH"}
+
+local SYM_UP   = CHAR_UP   -- ▲ (high)
+local SYM_DOWN = CHAR_DOWN -- ▼ (low)
+
+local FM_AREA_W   = 26
+local FM_DISARMED = { ["OK"]=true, ["!ERR"]=true, ["WAIT"]=true, [""] = true }
+
+-- Equirectangular distance approximation; accurate to ~0.5% for distances < 100 km.
+local RAD     = math.pi / 180
+local R_EARTH = 6371000  -- metres
+local LAT_DIVISORS = { 800000, 40000, 2000, 100, 5 }
+local LON_DIVISORS = { 640000, 32000, 1600, 80, 4 }
+local ALPHABET     = "23456789CFGHJMPQRVWX"
+
+local QR_PAD = { 236, 17 } -- QR padding bytes 0xEC/0x11 per spec; fixed, never changes
+local QR_BASE = {          -- {base_value, write_mask}: 1-bits in write_mask mark reserved/fixed modules.
+    { 0x1fc007f, 0x1fe01ff }, { 0x1040041, 0x1fe01ff }, { 0x174015d, 0x1fe01ff }, { 0x174005d, 0x1fe01ff },
+    { 0x174005d, 0x1fe01ff }, { 0x1040041, 0x1fe01ff }, { 0x1fd557f, 0x1ffffff }, { 0x0000100, 0x1fe01ff },
+    { 0x04601f7, 0x1fe01ff }, { 0x0000000, 0x0000040 }, { 0x0000040, 0x0000040 }, { 0x0000000, 0x0000040 },
+    { 0x0000040, 0x0000040 }, { 0x0000000, 0x0000040 }, { 0x0000040, 0x0000040 }, { 0x0000000, 0x0000040 },
+    { 0x01f0040, 0x01f0040 }, { 0x0110100, 0x01f01ff }, { 0x015017f, 0x01f01ff }, { 0x0110141, 0x01f01ff },
+    { 0x01f015d, 0x01f01ff }, { 0x000005d, 0x00001ff }, { 0x000015d, 0x00001ff }, { 0x0000141, 0x00001ff },
+    { 0x000017f, 0x00001ff }
+}
+-- Generator polynomial for QR v2-L (16 EC codewords, degree-16 over GF(256))
+local QR_GEN = { 59, 13, 104, 189, 68, 209, 30, 8, 163, 65, 41, 229, 98, 50, 36, 59 }
+
+local CFG_FILE          = "/SCRIPTS/TELEMETRY/rcic.cfg"
+
+local STATS_DEFAULTS = { max_alt = 0, total_dist = 0, min_voltage = 0, max_speed = 0, max_current = 0, max_sats = 0, mahdrain = 0, flight_time = 0, min_lq = 999 }
+
 -- ------------------------------------------------------------
--- 2.1. FUNCTION LOCALIZATION
+-- 3. EXTERNAL CONSTANTS/FUNCTION LOCALIZATION
 -- ------------------------------------------------------------
+
 -- Standard Lua
 local math_floor         = math.floor
 local math_abs           = math.abs
@@ -118,28 +160,41 @@ local getTime            = getTime
 local getValue           = getValue
 local playNumber         = playNumber
 local EVT_TOUCH_FIRST    = EVT_TOUCH_FIRST   -- nil on non-touch radios
-
 local ERASE_FLAG         = ERASE or 0  -- ERASE may be nil on monochrome radios; 0 = safe no-op fallback
 
 -- ------------------------------------------------------------
--- 3. SCREEN AND FONT DETECTION
+-- 4. ENVIRONMENT AND LAYOUT VARIABLES
 -- ------------------------------------------------------------
-local SCREEN_W, SCREEN_H
-local FONT_COORDS, FONT_INFO
-local SCREEN_CENTER_X
 
--- ------------------------------------------------------------
--- 4. LAYOUT
--- ------------------------------------------------------------
+local SCREEN_W, SCREEN_H, SCREEN_CENTER_X
+local FONT_COORDS, FONT_INFO
 local TAB_H, CONTENT_Y, CONTENT_H
 local LAYOUT
 local TABS, TABS_LAYOUT, TAB_W
 
+local qr_scale         = 1   -- pixels per QR module
+
+local alt_unit        = "m"
+local alt_factor      = 1.0
+local spd_unit        = "kmh"
+local spd_factor      = 1.0
+
+-- fallback TX warning threshold when getGeneralSettings() provides no battWarn value
+local bat_warn_default = 6.6
+
+local CFG_KEYS = { "cfg_rate", "cfg_alert", "cfg_audio", "cfg_int",
+		   "cfg_step", "cfg_sag", "cfg_tx_warn", "cfg_toast",
+		   "cfg_capacity", "cfg_minsats", "cfg_haptic",
+		   "cfg_autotab", "cfg_armswitch" }
+
+local toast_shot     = ""   -- pre-built in init() after language setup
+local toast_resetted = ""   -- pre-built in init() after language setup
+
 -- ------------------------------------------------------------
--- 5. TRANSLATION SYSTEM
+-- 4.1. TRANSLATION SYSTEM VARIABLES
 -- ------------------------------------------------------------
 
-local BASE_TEXTS        = {
+local BASE_TEXTS = {
     waiting   = "WAITING GPS",
     sats      = "SAT",
     altitude  = "ALT",
@@ -170,15 +225,18 @@ local BASE_TEXTS        = {
     cfg_capacity = "Battery MAH",
     cfg_minsats = "Min Sats",
     cfg_haptic = "Haptic",
+    cfg_autotab = "Auto Tab",
+    cfg_armswitch = "Arm SW",
     flt_time  = "FLT",
     min_lq    = "MIN LQ",
     loc_start = "ENTER: START",
     loc_dynpwr1 = "Best results obtained if",
     loc_dynpwr2 = "disable TX Dynamic Power",
     loc_nosig = "NO SIGNAL",
+    efficiency = "EFF",
 }
 
-local LANG_OVERRIDES    = {
+local LANG_OVERRIDES = {
     es = {
         waiting   = "ESPERANDO GPS",
         vcell     = "VCELDA",
@@ -381,19 +439,24 @@ local LANG_OVERRIDES    = {
 }
 
 -- ------------------------------------------------------------
--- 6. PERSISTENT VARIABLES
+-- 5. TELEMETRY ENGINE STATUS VARIABLES (Background)
 -- ------------------------------------------------------------
 
-local current_page     = 1
-local qr_scale         = 1   -- pixels per QR module
 local last_update_time = 0
 
-local gps_state         = {
+local telemetry_live   = false
+local prev_telem_live = false
+
+local sensors = {}
+
+local capa_is_pct = false
+local loc_is_elrs = false
+
+local gps_state = {
     lat           = 0,
     lon           = 0,
     alt           = 0,
     fix           = false,
-    plus_code     = "",
     plus_code_url = "",
     lat_str       = "0.000000",
     lon_str       = "0.000000",
@@ -403,8 +466,7 @@ local gps_state         = {
     prev_alt      = 0,     -- altitude from previous cycle for delta calculation
 }
 
-
-local bat_state         = {
+local bat_state = {
     cells        = 0,
     last_volt    = 0,
     alert_time   = 0,
@@ -429,94 +491,98 @@ local bat_state         = {
     last_cells   = -1,
 }
 
-local toast_msg         = nil
-local toast_time        = 0
-local toast_layout      = { x = 0, y = 0, w = 0, h = 11 }
+local stats = {}
+
+local fm_str        = nil
+local fm_armed      = false
+local armed_display = false
+
+-- ------------------------------------------------------------
+-- 6. INTERFACE STATE AND EVENTS VARIABLES (run)
+-- ------------------------------------------------------------
+
+local current_page     = 1
+local force_redraw     = true
+local last_blink_state = false
+
 local show_cfg          = false
-
-local telemetry_live    = false
-
 local cfg_sel           = 1
 local cfg_edit          = false
+local cfg_edit_snapshot = nil
 local cfg_changed       = false
-local CFG_FILE          = "/SCRIPTS/TELEMETRY/rcic.cfg"
+local cfg_scroll        = 0
+local cfg_items         = {}
 
--- Pre-allocated constants and buffers to reduce GC pressure
-local str_minus_minus_V = "--V"       -- placeholder shown when cell count is unknown
-local QR_PAD            = { 236, 17 } -- QR padding bytes 0xEC/0x11 per spec; fixed, never changes
-local qr_res            = {}          -- 25-row QR result buffer; reused across every regeneration
-local _alt_unit         = "m"
-local _alt_factor       = 1.0
-local _spd_unit         = "kmh"
-local _spd_factor       = 1.0
+local loc_active    = false
+local loc_next_play = 0
+local loc_sig       = nil       -- last raw signal value (dBm for ELRS, 0-100 for RSSI). nil = no sensor read.
+local loc_tpwr      = nil       -- TX power in mW from TPWR sensor; nil if sensor absent.
+local loc_sig_pct   = 0         -- normalised 0-100 value driving bar fill, beep rate and haptic.
+local loc_peak_pct  = 0         -- normalised peak 0-100, drives bar marker
 
--- Displays a centered toast notification for TOAST_DURATION centiseconds.
--- Recalculates width and position on every call to fit variable-length messages.
-local function show_toast(msg)
-    toast_msg = msg
-    toast_time = getTime()
+local toast_msg    = nil
+local toast_time   = 0
+local toast_layout = { x = 0, y = 0, w = 0, h = 11 }
 
-    local msg_w = math_max(#toast_msg * 6 + 10, 60)
+local sw_listen      = false  -- true while scanning for switch input
+local sw_snapshot    = {}     -- switch values at listen start
+local sw_pending     = ""     -- switch detected during listen, pending confirmation
+local sw_pending_val = 0
 
-    toast_layout.w = msg_w
-    toast_layout.x = math_floor((SCREEN_W - msg_w) / 2)
-    -- toast_layout.y is static, pre-calculated in init()
-end
-
-local force_redraw = true
-
-local STATS_DEFAULTS = { max_alt = 0, total_dist = 0, min_voltage = 0, max_speed = 0, max_current = 0, max_sats = 0, mahdrain = 0, flight_time = 0, min_lq = 999 }
-local stats = {}
+-- ------------------------------------------------------------
+-- 7. RENDERING BUFFERS & GC CACHE VARIABLES
+-- ------------------------------------------------------------
 
 local tot_strs = {
     l1_left  = "", l1_right = "",
     l2_left  = "", l2_right = "",
     l3_left  = "", l3_right = "",
     l4_left  = "", l4_right = "",
-    l5_left  = "",
+    l5_left  = "", l5_right = "",
 }
 
 local gps_str_info = ""
 local gps_sats_str = ""
+local last_sats   = -1
 
-local CFG_KEYS = {"cfg_rate","cfg_alert","cfg_audio","cfg_int","cfg_step","cfg_sag","cfg_tx_warn","cfg_toast","cfg_capacity","cfg_minsats","cfg_haptic"}
-local cfg_items = {}
+local qr_e, qr_l = nil, nil  -- GF(256) exp/log tables, built once in init()
+local qr_b       = {}        -- working bitstream buffer (data + EC + remainder bits)
+local qr_m       = {}        -- 28 data codewords as integers
+local qr_ec      = {}        -- 16 Reed-Solomon error correction codewords
+local qr_res     = {}        -- 25-row QR result buffer; reused across every regeneration
 
--- Resets all flight statistics to their default zero values.
--- Called on init and when the user triggers a manual reset from the TOT page.
-local function reset_stats()
-    for k, v in pairs(STATS_DEFAULTS) do stats[k] = v end
+local str_minus_minus_V = "--V"  -- placeholder shown when cell count is unknown
+
+local loc_sig_fmt  = ""      -- "%d dB"
+local loc_tpwr_fmt = "?mW"   -- "%dmW" o "?mW"
+local loc_pct_fmt  = "0%"    -- "%d%%"
+
+-- ------------------------------------------------------------
+-- 8. UTILITY FUNCTIONS
+-- ------------------------------------------------------------
+
+-- Returns a single display character representing the physical position of
+-- a switch based on its raw getValue() reading: SYM_UP (▲) when the value
+-- is positive (high), SYM_DOWN (▼) when negative (low), or "-" when zero
+-- (mid). Used to show the captured ARM_SWITCH position in the config
+-- overlay (cfg_items[13]) and during the live arm-switch capture session.
+local function sw_pos(val)
+    if     val > 0 then return SYM_UP
+    elseif val < 0 then return SYM_DOWN
+    else               return "-"
+    end
 end
-reset_stats()
 
--- sensor names
-local _s = {}
-
--- true if Fuel (not Capa)
-local _capa_is_pct = false
-
-local cfg_scroll = 0
-
--- fallback TX warning threshold when getGeneralSettings() provides no battWarn value
-local _bat_warn_default = 6.6
-
--- true when LOC sensor resolves to 1RSS/2RSS (ELRS); selects segmented dBm scaling
-local _loc_is_elrs  = false
-
-local loc_active    = false
-local loc_next_play = 0
-
--- last raw signal value (dBm for ELRS, 0-100 for RSSI). nil = no sensor read.
-local loc_sig = nil
--- TX power in mW from TPWR sensor; nil if sensor absent.
-local loc_tpwr = nil
--- normalised 0-100 value driving bar fill, beep rate and haptic.
-local loc_sig_pct = 0
-
--- ------------------------------------------------------------
--- 7. UTILITY FUNCTIONS
--- ------------------------------------------------------------
-
+-- Rebuilds the display value string for every item in cfg_items[], reflecting
+-- the current state of all runtime configuration variables. Called whenever
+-- the config overlay opens, after any setting is changed in edit mode, and
+-- during the arm-switch capture session to show the live switch position.
+-- Item 13 (ARM_SWITCH) has three display states:
+--   · Capture in progress + switch identified → "<SW><pos>"  (e.g. "SB^")
+--   · Capture idle + switch configured        → "<SW><pos>"  (e.g. "SA-")
+--   · No switch configured                    → "--"
+-- All other items format their corresponding runtime variable directly into
+-- a short string sized to fit the config overlay value column.
 local function refresh_cfg_vals()
     cfg_items[1].val  = string_fmt("%.1fs", UPDATE_RATE / 100)
     cfg_items[2].val  = BATTERY_ALERT_ENABLED and BASE_TEXTS.cfg_on or BASE_TEXTS.cfg_off
@@ -529,26 +595,93 @@ local function refresh_cfg_vals()
     cfg_items[9].val  = string_fmt("%dmAh", BAT_CAPACITY_MAH)
     cfg_items[10].val = string_fmt("%d", MIN_SATS)
     cfg_items[11].val = HAPTIC and BASE_TEXTS.cfg_on or BASE_TEXTS.cfg_off
-end
-
--- Serialises all user-configurable settings to a CSV file on the SD card.
--- Field order is fixed; see load_config() code for the mapping.
-local function save_config()
-    local file = io.open(CFG_FILE, "w")
-    if file then
-	io.write(file, string_fmt("%d,%d,%d,%d,%.2f,%d,%.1f,%d,%d,%d,%d",
-	    UPDATE_RATE, BATTERY_ALERT_ENABLED and 1 or 0,
-	    BATTERY_ALERT_AUDIO and 1 or 0,
-	    BATTERY_ALERT_INTERVAL, BATTERY_ALERT_STEP,
-	    SAG_CURRENT_THRESHOLD, TX_BAT_WARN,
-	    TOAST_DURATION, BAT_CAPACITY_MAH, MIN_SATS,
-	    HAPTIC and 1 or 0))
-        io.close(file)
+    cfg_items[12].val = AUTO_TAB and BASE_TEXTS.cfg_on or BASE_TEXTS.cfg_off
+    if sw_listen and sw_pending ~= "" then
+	cfg_items[13].val = sw_pending .. sw_pos(sw_pending_val)
+    elseif ARM_SWITCH ~= "" then
+	cfg_items[13].val = ARM_SWITCH .. sw_pos(ARM_VALUE)
+    else
+	cfg_items[13].val = "--"
     end
 end
 
--- Reads and parses the CSV config file from SD card, applying values to runtime vars.
--- Missing or extra fields are silently ignored, preserving forward compatibility.
+-- Assigns val directly to the runtime configuration variable mapped to sel
+-- (1–12). Used by the rotary handler (via cfg_set_var) and by the edit-cancel
+-- path (EVT_EXIT_BREAK) to restore a snapshot. Item 13 (ARM_SWITCH) is not
+-- handled here: its capture lifecycle is managed separately by sw_listen /
+-- confirm_sw_listen. Callers must invoke refresh_cfg_vals() after this call
+-- to rebuild the cfg_items[].val display strings.
+local function cfg_set_var(sel, val)
+    if     sel == 1  then UPDATE_RATE             = val
+    elseif sel == 2  then BATTERY_ALERT_ENABLED   = val
+    elseif sel == 3  then BATTERY_ALERT_AUDIO     = val
+    elseif sel == 4  then BATTERY_ALERT_INTERVAL  = val
+    elseif sel == 5  then BATTERY_ALERT_STEP      = val
+    elseif sel == 6  then SAG_CURRENT_THRESHOLD   = val
+    elseif sel == 7  then TX_BAT_WARN             = val
+    elseif sel == 8  then TOAST_DURATION          = val
+    elseif sel == 9  then BAT_CAPACITY_MAH        = val
+    elseif sel == 10 then MIN_SATS                = val
+    elseif sel == 11 then HAPTIC                  = val
+    elseif sel == 12 then AUTO_TAB                = val
+    end
+end
+
+-- Wraps a 1-based index cyclically within [1..n], stepping by dir (+1 or -1).
+-- Handles both forward and backward wrapping: stepping past n returns 1,
+-- stepping before 1 returns n. Used for tab navigation in run() and for
+-- scrolling through cfg_items[] in handle_cfg_events().
+-- Example: cycle(4, 4, 1) → 1,  cycle(1, 4, -1) → 4
+local function cycle(val, n, dir) return (val - 1 + dir + n) % n + 1 end
+
+-- ------------------------------------------------------------
+-- 9. INIT & RELATED FUNCTIONS
+-- ------------------------------------------------------------
+
+-- Resets all flight statistics to their zero/default values by copying
+-- every field from STATS_DEFAULTS into the stats table. Covers max altitude,
+-- total distance, min cell voltage, max speed, max current, max satellites,
+-- mAh drain, flight time, and min link quality (min_lq resets to 999 so
+-- the first real reading always becomes the new minimum).
+-- Called once at startup and whenever the user triggers a manual reset
+-- from the TOT page (EVT_ENTER_BREAK on current_page == 3).
+local function reset_stats()
+    for k, v in pairs(STATS_DEFAULTS) do stats[k] = v end
+end
+
+-- Builds the GF(256) exponent and log lookup tables used by the Reed-Solomon
+-- ECC encoder inside generate_qrv2(). The field is constructed over the
+-- irreducible primitive polynomial x^8+x^4+x^3+x^2+1 (0x11D = 285), the
+-- same polynomial used by the QR Code specification and AES.
+-- qr_e[i] = alpha^i mod p(x)  — antilog / exponent table (0..255)
+-- qr_l[v] = log_alpha(v)      — log table (1..255; v=0 is undefined)
+-- Together they reduce GF(256) multiply/divide to integer addition and a
+-- mod-255 table lookup, avoiding per-symbol division in the hot RS loop.
+-- Guarded by (not qr_e) so repeated calls to init() are safe with no cost.
+local function init_gf_tables()
+    if not qr_e then
+        qr_e, qr_l = {}, {}
+        local x = 1
+        for i = 0, 254 do
+            qr_e[i] = x
+--	    if not qr_l[x] then qr_l[x] = i end
+            qr_l[x] = i
+            x = x * 2
+            if x > 255 then x = x ~ 285 end
+        end
+        qr_e[255] = qr_e[0]
+    end
+end
+
+-- Reads and parses the persistent configuration from the SD card CSV file
+-- (CFG_FILE). Fields are positionally mapped in the same order used by
+-- save_config(): update rate, alert flags, intervals, thresholds, imperial
+-- units, capacity, ARM switch index and value. Missing or extra fields are
+-- silently ignored, preserving forward and backward compatibility across
+-- firmware versions. If the file is absent or empty, all runtime variables
+-- retain their compiled-in defaults. The ARM switch is resolved from its
+-- stored 1-based index back to a name in ARM_SW_LIST ("SA"…"SH"); index 0
+-- means no switch configured (ARM_SWITCH = "").
 local function load_config()
     local file = io.open(CFG_FILE, "r")
     if not file then return end
@@ -566,24 +699,155 @@ local function load_config()
     if n(2) then BATTERY_ALERT_ENABLED  = n(2) == 1   end
     if n(3) then BATTERY_ALERT_AUDIO    = n(3) == 1   end
     if n(4) then BATTERY_ALERT_INTERVAL = n(4)        end
-    if n(5) then BATTERY_ALERT_STEP     = n(5)        end
+    if n(5) then BATTERY_ALERT_STEP     = n(5) / 100  end
     if n(6) then SAG_CURRENT_THRESHOLD  = n(6)        end
-    if n(7) then TX_BAT_WARN            = n(7)        end
+    if n(7) then TX_BAT_WARN            = n(7) / 10   end
     if n(8)  then TOAST_DURATION        = n(8)        end
     if n(9)  then BAT_CAPACITY_MAH      = n(9)        end
     if n(10) then MIN_SATS              = n(10)       end
     if n(11) then HAPTIC                = n(11) == 1  end
+    if n(12) then AUTO_TAB              = n(12) == 1  end
+    if n(13) then ARM_SWITCH            = (n(13) > 0 and ARM_SW_LIST[n(13)]) or "" end
+    if n(14) then ARM_VALUE             = n(14)       end
 end
 
--- Uses v_max + 0.05 V as the per-cell ceiling instead of v_max to avoid
--- misclassifying a freshly charged pack. Example: a 4S LiPo at 16.82 V
--- divided by 4.20 gives 4.004 → floor = 4 correct, but at exactly 16.80 V
--- divided by 4.20 gives exactly 4.000 → floor = 4 still correct.
--- Without the margin, floating-point drift could produce 3.999 → floor = 3.
-local function detect_cells(voltage)
-    if voltage < 0.5 then return 0 end
-    -- +0.05 V margin per chemistry — LiPo: 4.25  LiHV: 4.40  LiIon: 4.25
-    return math_floor(voltage / (BAT_CONFIG[bat_state.cfg_idx].v_max + 0.05)) + 1
+-- Applies language overrides from LANG_OVERRIDES to BASE_TEXTS, pre-builds
+-- toast strings, populates cfg_items labels, and applies radio-level settings
+-- (TX battery warning threshold, imperial units). Finishes by loading the
+-- persistent config from SD card so all user settings are active before the
+-- first draw cycle.
+local function apply_language(gs)
+    local LANG = (gs.language and string_sub(string_lower(gs.language), 1, 2)) or "en"
+    if LANG_OVERRIDES[LANG] then
+        for k, v in pairs(LANG_OVERRIDES[LANG]) do BASE_TEXTS[k] = v end
+    end
+
+    toast_shot     = "** " .. BASE_TEXTS.shot     .. " **"
+    toast_resetted = "** " .. BASE_TEXTS.resetted .. " **"
+
+    for i, key in ipairs(CFG_KEYS) do
+        cfg_items[i] = { label = BASE_TEXTS[key], val = "" }
+    end
+
+    TX_BAT_WARN       = gs.battWarn or bat_warn_default
+    bat_warn_default = gs.battWarn or bat_warn_default
+    if gs.imperial ~= nil then USE_IMPERIAL = gs.imperial ~= 0 end
+    if USE_IMPERIAL then
+        alt_unit   = "ft";  alt_factor  = 3.28084
+        spd_unit   = "mph"; spd_factor  = 0.621371
+    end
+end
+
+-- Detects screen dimensions and selects font sizes accordingly.
+-- Small screens (< 300 px): MIDSIZE coords, SMLSIZE info.
+-- Large screens (TX16S, TX12 Mk2, Boxer, etc.): DBLSIZE coords, MIDSIZE info.
+-- Also derives qr_scale (1–4 px/module) from screen width so the QR code
+-- fills the available space without overflowing on any supported radio.
+local function detect_screen()
+    SCREEN_W    = LCD_W or 128
+    SCREEN_H    = LCD_H or 64
+    FONT_COORDS = MIDSIZE
+    FONT_INFO   = SMLSIZE
+    if SCREEN_W >= 300 then
+        FONT_COORDS = DBLSIZE
+        FONT_INFO   = MIDSIZE
+    end
+    qr_scale = math_min(4, math_floor(SCREEN_W / 100))
+end
+
+-- Pre-computes all layout positions as absolute pixel coordinates to avoid
+-- repeated arithmetic inside draw functions. Covers GPS, BAT, TOT, LOC and
+-- CFG overlay geometry, the toast Y position, and tab bar hit regions.
+-- Must be called after detect_screen() so SCREEN_W/H are already set.
+local function compute_layout()
+    SCREEN_CENTER_X = math_floor(SCREEN_W / 2)
+    TAB_H           = 9
+    CONTENT_Y       = TAB_H + 1
+    CONTENT_H       = SCREEN_H - CONTENT_Y
+
+    LAYOUT = {
+        coord_lat_y = CONTENT_Y + math_floor(CONTENT_H * 0.09),
+        coord_lon_y = CONTENT_Y + math_floor(CONTENT_H * 0.37),
+        info_y      = CONTENT_Y + math_floor(CONTENT_H * 0.65),
+        url_y       = CONTENT_Y + math_floor(CONTENT_H * 0.84),
+        waiting_y   = CONTENT_Y + math_floor(CONTENT_H * 0.25),
+        sats_y      = CONTENT_Y + math_floor(CONTENT_H * 0.70),
+        bat_label_y = CONTENT_Y + math_floor(CONTENT_H * 0.038),
+        bat_value_y = CONTENT_Y + math_floor(CONTENT_H * 0.25),
+        bat_cell_y  = CONTENT_Y + math_floor(CONTENT_H * 0.25),
+        bat_pct_y   = CONTENT_Y + math_floor(CONTENT_H * 0.65),
+        bat_bar_y   = CONTENT_Y + math_floor(CONTENT_H * 0.815),
+        bar_w       = SCREEN_W - 2,
+        tot_line1_y = CONTENT_Y + math_floor(CONTENT_H * 0.03),
+        tot_line2_y = CONTENT_Y + math_floor(CONTENT_H * 0.22),
+        tot_line3_y = CONTENT_Y + math_floor(CONTENT_H * 0.40),
+        tot_line4_y = CONTENT_Y + math_floor(CONTENT_H * 0.56),
+        tot_line5_y = CONTENT_Y + math_floor(CONTENT_H * 0.78),
+        gps_lost_h  = SCREEN_H - CONTENT_Y,
+	cfg_item_h  = 8,
+	qr_x        = 18,
+	qr_y        = CONTENT_Y + math_floor(CONTENT_H * 0.15),
+    }
+
+    LAYOUT.cfg_visible = math_floor((math_min(SCREEN_H - 10, 60) - 4) / LAYOUT.cfg_item_h)
+    local _cw = math_min(SCREEN_W - 10, 180)
+    local _ch = math_min(SCREEN_H - 10, 60)
+    LAYOUT.cfg_x  = math_floor((SCREEN_W - _cw) / 2)
+    LAYOUT.cfg_y  = math_floor((SCREEN_H - _ch) / 2)
+    LAYOUT.cfg_w  = _cw
+    LAYOUT.cfg_h  = _ch
+
+    local _lcw = math_max(4, math_floor(SCREEN_W / 20))
+    LAYOUT.loc_cell_w = _lcw
+    LAYOUT.loc_cell_h = math_floor(CONTENT_H * 0.40)
+    LAYOUT.loc_cell_n = math_floor((SCREEN_W - 4) / _lcw)
+    LAYOUT.loc_cell_y = SCREEN_H - LAYOUT.loc_cell_h - 1
+
+    LAYOUT.loc_cell_bw   = LAYOUT.loc_cell_w - 1   -- rect border width
+    LAYOUT.loc_cell_iw   = LAYOUT.loc_cell_w - 3   -- filled inner width
+    LAYOUT.loc_cell_ih   = LAYOUT.loc_cell_h - 2   -- filled inner height
+    LAYOUT.loc_peak_off  = math_floor((LAYOUT.loc_cell_w - 1) / 2) - 1
+
+    toast_layout.y  = math_floor(SCREEN_H / 2) - 5
+
+    TABS        = { BASE_TEXTS.tab_bat, BASE_TEXTS.tab_gps, BASE_TEXTS.tab_tot, BASE_TEXTS.tab_loc }
+    TAB_W       = math_floor((SCREEN_W - FM_AREA_W) / #TABS)
+    TABS_LAYOUT = {}
+    for i = 1, #TABS do
+        local x = (i - 1) * TAB_W
+	local w = (i == #TABS) and (SCREEN_W - FM_AREA_W - x) or TAB_W
+        TABS_LAYOUT[i] = { name = TABS[i], x = x, w = w, centerText_x = x + math_floor(w / 2) }
+    end
+end
+
+-- ------------------------------------------------------------
+
+local function init()
+    reset_stats()
+    init_gf_tables()
+    local gs = getGeneralSettings() or {}
+    apply_language(gs)
+    detect_screen()
+    load_config()
+    compute_layout()
+end
+
+-- ------------------------------------------------------------
+-- 10. DATA UPDATE (BACKGROUND) & RELATED FUNCTIONS
+-- ------------------------------------------------------------
+
+-- Probes all sensor candidates in SENSOR_MAP and caches the first responding name.
+-- Sets loc_is_elrs true when the resolved LOC sensor is 1RSS/2RSS (ELRS link).
+-- Runs once after telemetry becomes live; resets sensors.done on link loss to re-detect.
+local function detect_sensors()
+    for key, candidates in pairs(SENSOR_MAP) do
+        for _, name in ipairs(candidates) do
+            if getValue(name) ~= nil then sensors[key] = name; break end
+        end
+    end
+    capa_is_pct = (sensors.capa == "Fuel")
+    loc_is_elrs = (sensors.loc == "1RSS" or sensors.loc == "2RSS")
+    sensors.done = true
 end
 
 -- EdgeTX GPS sensor returns {lat=0, lon=0} before acquiring a fix.
@@ -594,9 +858,17 @@ local function is_valid_gps(lat, lon)
         lat >= -90 and lat <= 90 and lon >= -180 and lon <= 180
 end
 
-local lat_divisors = { 800000, 40000, 2000, 100, 5 }
-local lon_divisors = { 640000, 32000, 1600, 80, 4 }
-local alphabet     = "23456789CFGHJMPQRVWX"
+-- Approximates the great-circle distance between two WGS-84 coordinate pairs
+-- using the equirectangular projection. Multiplies the longitude delta by
+-- cos(mid-latitude) to correct for meridian convergence, then applies
+-- Pythagoras in radians scaled by Earth's mean radius (6 371 000 m).
+-- Accurate to ~0.5% for distances under 100 km — sufficient for drone telemetry.
+-- Returns distance in metres as a float.
+local function fast_dist(lat1, lon1, lat2, lon2)
+    local x = (lon2 - lon1) * RAD * math_cos((lat1 + lat2) / 2 * RAD)
+    local y = (lat2 - lat1) * RAD
+    return math_sqrt(x * x + y * y) * R_EARTH
+end
 
 -- Encodes a WGS-84 coordinate pair as an Open Location Code (Plus Code).
 -- Output: 11-character code, e.g. "8FRCGP22+WH"
@@ -611,73 +883,17 @@ local function to_plus_code(lat, lon)
     local code = ""
 
     for i = 1, 5 do
-        local ld = math_floor(lat_val / lat_divisors[i]) % 20
-        local od = math_floor(lon_val / lon_divisors[i]) % 20
+        local ld = math_floor(lat_val / LAT_DIVISORS[i]) % 20
+        local od = math_floor(lon_val / LON_DIVISORS[i]) % 20
         code = code
-            .. string_sub(alphabet, ld + 1, ld + 1)
-            .. string_sub(alphabet, od + 1, od + 1)
+            .. string_sub(ALPHABET, ld + 1, ld + 1)
+            .. string_sub(ALPHABET, od + 1, od + 1)
         if i == 4 then code = code .. "+" end
     end
 
     local ndx = (lat_val % 5) * 4 + (lon_val % 4)
-    return code .. string_sub(alphabet, ndx + 1, ndx + 1)
+    return code .. string_sub(ALPHABET, ndx + 1, ndx + 1)
 end
-
--- Equirectangular distance approximation; accurate to ~0.5% for distances < 100 km.
-local RAD     = math.pi / 180
-local R_EARTH = 6371000  -- metres
-
-local function fast_dist(lat1, lon1, lat2, lon2)
-    local x = (lon2 - lon1) * RAD * math_cos((lat1 + lat2) / 2 * RAD)
-    local y = (lat2 - lat1) * RAD
-    return math_sqrt(x * x + y * y) * R_EARTH
-end
-
--- Returns a human-readable distance string: metres below 1 km, kilometres above.
-local function format_dist(meters)
-    if USE_IMPERIAL then
-        local ft = meters * 3.28084
-        return ft >= 5280
-            and string_fmt("%.2fmi", ft / 5280)
-            or  string_fmt("%.0fft", ft)
-    end
-    return meters >= 1000
-        and string_fmt("%.2fkm", meters / 1000)
-        or  string_fmt("%.0fm",  meters)
-end
-
--- Wraps a 1-based index cyclically within [1..n], stepping by dir (+1 or -1).
-local function cycle(val, n, dir) return (val - 1 + dir + n) % n + 1 end
-
--- QR Code v2-L generator producing a 25×25 module matrix.
--- Encodes a "geo:lat,lon" URI suitable for any QR scanner.
--- Uses Lua 5.3 native bitwise operators (EdgeTX 2.9+ / Lua 5.3 required).
--- Output is written into the pre-allocated module-level qr_res table.
---
--- qr_e / qr_l : GF(256) exp/log tables, built once in init()
--- qr_b        : working bitstream buffer (data + EC + remainder bits)
--- qr_m        : 28 data codewords as integers
--- qr_ec       : 16 Reed-Solomon error correction codewords
--- qr_base     : fixed module pattern (finder patterns, timing, format info)
--- qr_gen      : RS generator polynomial coefficients for v2-L (16 EC codewords)
-local qr_e, qr_l = nil, nil
-local qr_b = {}
-local qr_m = {}
-local qr_ec = {}
-
--- {base_value, write_mask}: 1-bits in write_mask mark reserved/fixed modules.
-local qr_base = {
-    { 0x1fc007f, 0x1fe01ff }, { 0x1040041, 0x1fe01ff }, { 0x174015d, 0x1fe01ff }, { 0x174005d, 0x1fe01ff },
-    { 0x174005d, 0x1fe01ff }, { 0x1040041, 0x1fe01ff }, { 0x1fd557f, 0x1ffffff }, { 0x0000100, 0x1fe01ff },
-    { 0x04601f7, 0x1fe01ff }, { 0x0000000, 0x0000040 }, { 0x0000040, 0x0000040 }, { 0x0000000, 0x0000040 },
-    { 0x0000040, 0x0000040 }, { 0x0000000, 0x0000040 }, { 0x0000040, 0x0000040 }, { 0x0000000, 0x0000040 },
-    { 0x01f0040, 0x01f0040 }, { 0x0110100, 0x01f01ff }, { 0x015017f, 0x01f01ff }, { 0x0110141, 0x01f01ff },
-    { 0x01f015d, 0x01f01ff }, { 0x000005d, 0x00001ff }, { 0x000015d, 0x00001ff }, { 0x0000141, 0x00001ff },
-    { 0x000017f, 0x00001ff }
-}
-
--- Generator polynomial for QR v2-L (16 EC codewords, degree-16 over GF(256))
-local qr_gen = { 59, 13, 104, 189, 68, 209, 30, 8, 163, 65, 41, 229, 98, 50, 36, 59 }
 
 -- Encodes a "geo:lat,lon" URI as a QR Code version 2-L (25×25 modules,
 -- ~7% error correction). Version 2-L was chosen because:
@@ -735,7 +951,7 @@ local function generate_qrv2(lat, lon)
         qr_ec[16] = 0
         if f ~= 0 then
             local lf = qr_l[f]
-            for j = 1, 16 do qr_ec[j] = qr_ec[j] ~ qr_e[(lf + qr_l[qr_gen[j]]) % 255] end
+            for j = 1, 16 do qr_ec[j] = qr_ec[j] ~ qr_e[(lf + qr_l[QR_GEN[j]]) % 255] end
         end
     end
 
@@ -749,7 +965,7 @@ local function generate_qrv2(lat, lon)
     pb(0, 7)
 
     -- Initialise qr_res from the fixed base pattern (finder patterns, timing, format info)
-    for r = 0, 24 do qr_res[r + 1] = qr_base[r + 1][1] end
+    for r = 0, 24 do qr_res[r + 1] = QR_BASE[r + 1][1] end
 
     -- Place data bits using diagonal column scan (right-to-left column pairs, top/bottom sweep).
     -- Applies mask pattern 0: invert module when (row + col) % 2 == 0.
@@ -759,7 +975,7 @@ local function generate_qrv2(lat, lon)
         for _ = 1, 25 do
             for col = 0, 1 do
                 local nx = cx - col
-		if (qr_base[cy + 1][2] & (1 << nx)) == 0 then  -- skip reserved modules
+		if (QR_BASE[cy + 1][2] & (1 << nx)) == 0 then  -- skip reserved modules
                     local bit = qr_b[bd]
                     bd = bd + 1
 		    if (cy + nx) % 2 == 0 then bit = bit ~ 1 end  -- mask pattern 0
@@ -775,145 +991,130 @@ local function generate_qrv2(lat, lon)
     return qr_res
 end
 
--- Returns the raw signal value from the active LOC sensor, or nil if unavailable.
--- Returns nil also when the sensor reads exactly 0 (no-signal sentinel value).
-local function loc_get_signal()
-    if not _s.loc then return nil end
-    local v = getValue(_s.loc)
-    return v ~= 0 and v or nil
+-- Processes a confirmed valid GPS reading: applies a 2-metre jitter gate to
+-- avoid redundant Plus Code and QR regeneration on a stationary craft, accumulates
+-- travel distance with a teleport-jump filter (GPS_MAX_JUMP), and updates the
+-- cached coordinate strings, Plus Code URL, QR matrix, position, altitude,
+-- fix flag, and max altitude / max speed stats.
+local function update_gps_position(cur_lat, cur_lon, alt, gspd)
+    if gps_state.lat ~= cur_lat or gps_state.lon ~= cur_lon then
+        local do_update = not gps_state.fix
+
+        if gps_state.fix then
+            local d = fast_dist(gps_state.lat, gps_state.lon, cur_lat, cur_lon)
+            if d < GPS_MAX_JUMP then stats.total_dist = stats.total_dist + d end
+            do_update = d > 2.0
+        end
+
+        if do_update then
+            gps_state.lat_str       = string_fmt("%.6f", cur_lat)
+            gps_state.lon_str       = string_fmt("%.6f", cur_lon)
+            gps_state.plus_code_url = "OLC:" .. to_plus_code(cur_lat, cur_lon)
+            gps_state.qr_cache      = generate_qrv2(cur_lat, cur_lon)
+        end
+    end
+
+    gps_state.lat = cur_lat
+    gps_state.lon = cur_lon
+    gps_state.alt = alt
+    gps_state.fix = true
+
+    if alt  > stats.max_alt   then stats.max_alt   = alt  end
+    if gspd > stats.max_speed then stats.max_speed = gspd end
 end
 
--- ------------------------------------------------------------
--- 8. INIT FUNCTION
--- ------------------------------------------------------------
+-- Pre-formats all battery display strings into bat_state to avoid string
+-- allocations inside draw functions. Updates rx_fmt, cell_fmt, bat_tx_fmt,
+-- pct_val and pct_str every cycle. Rebuilds cell_s and chem_cell_str only
+-- when the detected cell count changes.
+local function update_bat_strings()
+    local bcfg = BAT_CONFIG[bat_state.cfg_idx]
+    bat_state.rx_fmt     = string_fmt("%.2fV", bat_state.rx_bt)
+    bat_state.cell_fmt   = string_fmt("%.2fV", bat_state.cell_voltage)
+    bat_state.bat_tx_fmt = string_fmt("%.1fV", bat_state.bat_tx)
+    bat_state.pct_val    = bat_state.cells > 0 and
+        math_max(0, math_min(1, (bat_state.cell_voltage - bcfg.v_min) / bcfg.v_range)) or 0
 
-local function init()
-    -- Build GF(256) exp/log tables for Reed-Solomon ECC.
-    -- Uses the irreducible polynomial x^8+x^4+x^3+x^2+1 = 0x11D (285 decimal),
-    -- the same primitive used by both QR Code and AES.
-    if not qr_e then
-        qr_e, qr_l = {}, {}
-        local x = 1
-        for i = 0, 254 do
-            qr_e[i] = x
-            qr_l[x] = i
-            x = x * 2
-	    if x > 255 then x = x ~ 285 end  -- reduce modulo the GF(256) polynomial
-        end
-        qr_e[255] = qr_e[0]
+    if bat_state.cells ~= bat_state.last_cells then
+        bat_state.last_cells    = bat_state.cells
+        bat_state.cell_s        = string_fmt("%dS", bat_state.cells)
+        bat_state.chem_cell_str = string_fmt("%s [%s]", bcfg.text,
+            bat_state.cells > 0 and bat_state.cell_s or "-S")
     end
 
-    local gs = getGeneralSettings() or {}
-
-    -- Apply language overrides; falls back to English if the locale is not found.
-    local LANG = (gs.language and string_sub(string_lower(gs.language), 1, 2)) or "en"
-
-    if LANG_OVERRIDES[LANG] then
-        for k, v in pairs(LANG_OVERRIDES[LANG]) do BASE_TEXTS[k] = v end
+    local pct = math_floor(bat_state.pct_val * 100)
+    if bat_state.cells > 0 and bat_state.curr > 0.5 then
+        local mins = math_floor(BAT_CAPACITY_MAH * bat_state.pct_val / bat_state.curr * 60 / 1000)
+        bat_state.pct_str = string_fmt("%d%% ~%dm", pct, mins)
+    else
+        bat_state.pct_str = string_fmt("%d%%", pct)
     end
+end
 
-    -- Populate config menu labels after language selection
-    for i, key in ipairs(CFG_KEYS) do
-	cfg_items[i] = { label = BASE_TEXTS[key], val = "" }
-    end
-
-    TX_BAT_WARN = gs.battWarn or _bat_warn_default
-    _bat_warn_default = gs.battWarn or _bat_warn_default
-    if gs.imperial ~= nil then USE_IMPERIAL = gs.imperial ~= 0 end
+-- Converts a raw distance in metres to a human-readable string.
+-- Below 1 000 m returns an integer metre value ("542m").
+-- At or above 1 000 m returns a two-decimal kilometre value ("1.23km").
+-- When USE_IMPERIAL is true, converts to feet below one mile ("1 247ft")
+-- or decimal miles at or above ("0.77mi").
+-- Output is pre-formatted for direct use in lcd_drawText — no further
+-- allocation needed at the call site.
+local function format_dist(meters)
     if USE_IMPERIAL then
-	_alt_unit   = "ft";  _alt_factor  = 3.28084
-	_spd_unit   = "mph"; _spd_factor  = 0.621371
+        local ft = meters * 3.28084
+        return ft >= 5280
+            and string_fmt("%.2fmi", ft / 5280)
+            or  string_fmt("%.0fft", ft)
     end
-
-    load_config()
-
-    -- Detect screen dimensions and select font sizes accordingly
-    SCREEN_W    = LCD_W or 128
-    SCREEN_H    = LCD_H or 64
-    FONT_COORDS = MIDSIZE
-    FONT_INFO   = SMLSIZE
-    if SCREEN_W >= 300 then  -- large-screen radios (TX16S, TX12 Mk2, Boxer, etc.)
-        FONT_COORDS = DBLSIZE
-        FONT_INFO   = MIDSIZE
-    end
-
-    -- 128px = 1, 320px = 3, 480px = 4
-    qr_scale = math_min(4, math_floor(SCREEN_W / 100))
-
-    -- Pre-compute all layout positions as absolute pixel coordinates to
-    -- avoid repeated arithmetic inside the draw functions.
-    SCREEN_CENTER_X = math_floor(SCREEN_W / 2)
-    TAB_H           = 9
-    CONTENT_Y       = TAB_H + 1
-    CONTENT_H       = SCREEN_H - CONTENT_Y
-
-    LAYOUT          = {
-        coord_lat_y = CONTENT_Y + math_floor(CONTENT_H * 0.09),
-        coord_lon_y = CONTENT_Y + math_floor(CONTENT_H * 0.37),
-        info_y      = CONTENT_Y + math_floor(CONTENT_H * 0.65),
-        url_y       = CONTENT_Y + math_floor(CONTENT_H * 0.84),
-        waiting_y   = CONTENT_Y + math_floor(CONTENT_H * 0.25),
-        sats_y      = CONTENT_Y + math_floor(CONTENT_H * 0.70),
-        bat_label_y = CONTENT_Y + math_floor(CONTENT_H * 0.038),
-        bat_value_y = CONTENT_Y + math_floor(CONTENT_H * 0.25),
-        bat_cell_y  = CONTENT_Y + math_floor(CONTENT_H * 0.25),
-        bat_pct_y   = CONTENT_Y + math_floor(CONTENT_H * 0.65),
-        bat_bar_y   = CONTENT_Y + math_floor(CONTENT_H * 0.815),
-        bar_w       = SCREEN_W - 2,
-        tot_line1_y = CONTENT_Y + math_floor(CONTENT_H * 0.03),
-        tot_line2_y = CONTENT_Y + math_floor(CONTENT_H * 0.22),
-        tot_line3_y = CONTENT_Y + math_floor(CONTENT_H * 0.40),
-        tot_line4_y = CONTENT_Y + math_floor(CONTENT_H * 0.56),
-        tot_line5_y = CONTENT_Y + math_floor(CONTENT_H * 0.78),
-        gps_lost_h  = SCREEN_H - CONTENT_Y,
-	cfg_item_h  = 8,
-	qr_x        = 18,
-	qr_y        = CONTENT_Y + math_floor(CONTENT_H * 0.15),
-    }
-
-    LAYOUT.cfg_visible = math_floor((math_min(SCREEN_H - 10, 60) - 4) / LAYOUT.cfg_item_h)
-    local _cw = math_min(SCREEN_W - 10, 180)
-    local _ch = math_min(SCREEN_H - 10, 60)
-    LAYOUT.cfg_x  = math_floor((SCREEN_W - _cw) / 2)
-    LAYOUT.cfg_y  = math_floor((SCREEN_H - _ch) / 2)
-    LAYOUT.cfg_w  = _cw
-    LAYOUT.cfg_h  = _ch
-
-    local _lcw = math_max(4, math_floor(SCREEN_W / 20))
-    LAYOUT.loc_cell_w = _lcw
-    LAYOUT.loc_cell_h = math_floor(CONTENT_H * 0.40)
-    LAYOUT.loc_cell_n = math_floor((SCREEN_W - 4) / _lcw)
-    LAYOUT.loc_cell_y = SCREEN_H - LAYOUT.loc_cell_h - 1
-
-    toast_layout.y  = math_floor(SCREEN_H / 2) - 5
-
-    -- Pre-compute tab geometry used for drawing and touch hit-testing
-    TABS        = { BASE_TEXTS.tab_bat, BASE_TEXTS.tab_gps, BASE_TEXTS.tab_tot, BASE_TEXTS.tab_loc }
-    TAB_W       = math_floor(SCREEN_W / #TABS)
-    TABS_LAYOUT = {}
-    for i = 1, #TABS do
-        local x = (i - 1) * TAB_W
-        local w = (i == #TABS) and (SCREEN_W - x) or TAB_W
-        TABS_LAYOUT[i] = { name = TABS[i], x = x, w = w, centerText_x = x + math_floor(w / 2) }
-    end
+    return meters >= 1000
+        and string_fmt("%.2fkm", meters / 1000)
+        or  string_fmt("%.0fm",  meters)
 end
 
--- Probes all sensor candidates in SENSOR_MAP and caches the first responding name.
--- Sets _loc_is_elrs true when the resolved LOC sensor is 1RSS/2RSS (ELRS link).
--- Runs once after telemetry becomes live; resets _s._done on link loss to re-detect.
-local function detect_sensors()
-    for key, candidates in pairs(SENSOR_MAP) do
-        for _, name in ipairs(candidates) do
-            if getValue(name) ~= nil then _s[key] = name; break end
-        end
-    end
-    _capa_is_pct = (_s.capa == "Fuel")
-    _loc_is_elrs = (_s.loc == "1RSS" or _s.loc == "2RSS")
-    _s._done = true
+-- Pre-formats all ten TOT-page stat strings into tot_strs to avoid string
+-- allocations inside draw_tot_page. Covers min voltage, max current, max
+-- altitude, total distance, max speed, max satellites, mAh drain, flight
+-- time, min link quality, and mAh/km efficiency. Called once per background
+-- cycle so draw_tot_page renders with zero allocations.
+local function update_tot_strings()
+    tot_strs.l1_left  = string_fmt("%s:%.2fV",  BASE_TEXTS.min_volt, stats.min_voltage)
+    tot_strs.l1_right = string_fmt("%s: %.1fA", BASE_TEXTS.max_cur,  stats.max_current)
+    tot_strs.l2_left  = string_fmt("%s: %.0f%s", BASE_TEXTS.max_alt,
+        stats.max_alt * alt_factor, alt_unit)
+    tot_strs.l2_right = string_fmt("%s: %s",    BASE_TEXTS.distance, format_dist(stats.total_dist))
+    tot_strs.l3_left  = string_fmt("%s: %.1f%s", BASE_TEXTS.max_spd,
+        stats.max_speed * spd_factor, spd_unit)
+    tot_strs.l3_right = string_fmt("%s: %d",    BASE_TEXTS.max_sats, stats.max_sats)
+    tot_strs.l4_left  = capa_is_pct
+        and string_fmt("%s: %d%%",  BASE_TEXTS.mahdrain, stats.mahdrain)
+        or  string_fmt("%s: %dmAh", BASE_TEXTS.mahdrain, stats.mahdrain)
+    tot_strs.l4_right = string_fmt("%s: %d:%02d", BASE_TEXTS.flt_time,
+        math_floor(stats.flight_time / 6000),
+        math_floor(stats.flight_time / 100) % 60)
+    tot_strs.l5_left  = stats.min_lq == 999
+        and string_fmt("%s: --",   BASE_TEXTS.min_lq)
+        or  string_fmt("%s: %d%%", BASE_TEXTS.min_lq, stats.min_lq)
+
+    local _km      = stats.total_dist / 1000
+    local _eff_val = (_km > 0.5 and stats.mahdrain > 0)
+        and (USE_IMPERIAL and (stats.mahdrain / (_km * 1.60934))
+        or  (stats.mahdrain / _km)) or nil
+    tot_strs.l5_right = _eff_val
+        and string_fmt("%s:%.0f%s", BASE_TEXTS.efficiency, _eff_val,
+            USE_IMPERIAL and "/mi" or "/km")
+        or  string_fmt("%s:--", BASE_TEXTS.efficiency)
 end
 
--- ------------------------------------------------------------
--- 9. DATA UPDATE (BACKGROUND) FUNCTION
+-- Uses v_max + 0.05 V as the per-cell ceiling instead of v_max to avoid
+-- misclassifying a freshly charged pack. Example: a 4S LiPo at 16.82 V
+-- divided by 4.20 gives 4.004 → floor = 4 correct, but at exactly 16.80 V
+-- divided by 4.20 gives exactly 4.000 → floor = 4 still correct.
+-- Without the margin, floating-point drift could produce 3.999 → floor = 3.
+local function detect_cells(voltage)
+    if voltage < 0.5 then return 0 end
+    -- +0.05 V margin per chemistry — LiPo: 4.25  LiHV: 4.40  LiIon: 4.25
+    return math_floor(voltage / (BAT_CONFIG[bat_state.cfg_idx].v_max + 0.05)) + 1
+end
+
 -- ------------------------------------------------------------
 
 local function background()
@@ -926,29 +1127,38 @@ local function background()
     last_update_time = current_time
 
     -- These sensors are available even without a full telemetry link.
-    if not _s._done then detect_sensors() end
+    if not sensors.done then detect_sensors() end
     bat_state.bat_tx = getValue("tx-voltage") or 0
-    gps_state.sats   = _s.sats and getValue(_s.sats) or 0
-    bat_state.rx_bt  = _s.rxbt and getValue(_s.rxbt) or 0
+    gps_state.sats   = sensors.sats and getValue(sensors.sats) or 0
+    bat_state.rx_bt  = sensors.rxbt and getValue(sensors.rxbt) or 0
 
     -- Active link?
-    local lq = _s.link and getValue(_s.link) or 0
+    local lq = sensors.link and getValue(sensors.link) or 0
     telemetry_live = lq > 0
-    if not telemetry_live and _s._done then _s._done = nil end
+
+    if not telemetry_live then
+	if sensors.done then sensors.done = nil end
+	fm_str  = nil    -- clear stale flight mode on link loss
+	fm_armed = false
+    end
 
     -- Skip remaining sensor reads when no active link
     if telemetry_live then
-	stats.flight_time = stats.flight_time + UPDATE_RATE
-
 	if lq < stats.min_lq then stats.min_lq = lq end
 
-	local gps_data = _s.gps  and getValue(_s.gps)  or nil
-	local alt      = _s.alt  and getValue(_s.alt)  or 0
-	local gspd     = _s.gspd and getValue(_s.gspd) or 0
-	local capa     = _s.capa and getValue(_s.capa) or 0
-	local curr     = _s.curr and getValue(_s.curr) or 0
-
+	local gps_data = sensors.gps  and getValue(sensors.gps)  or nil
+	local alt      = sensors.alt  and getValue(sensors.alt)  or 0
+	local gspd     = sensors.gspd and getValue(sensors.gspd) or 0
+	local capa     = sensors.capa and getValue(sensors.capa) or 0
+	local curr     = sensors.curr and getValue(sensors.curr) or 0
 	bat_state.curr = curr
+
+	-- Flight mode: read string sensor; update fm_armed state
+	if sensors.fmode then
+	    local fm = getValue(sensors.fmode)
+	    fm_str   = (type(fm) == "string" and #fm > 0) and fm or nil
+	    fm_armed = fm_str ~= nil and not FM_DISARMED[fm_str]
+	end
 
 	if gps_state.sats > stats.max_sats then
     	    stats.max_sats = gps_state.sats
@@ -960,51 +1170,41 @@ local function background()
     	    cur_lon = gps_data["lon"] or gps_data[2] or 0
 	end
 
-	if gps_state.sats >= MIN_SATS and is_valid_gps(cur_lat, cur_lon) then
-	    if gps_state.lat ~= cur_lat or gps_state.lon ~= cur_lon then
-		-- do_update gate: skip Plus Code and QR regeneration if the drone moved
-		-- less than 2 m. GPS sensors quantise to ~1 m; this prevents redundant
-		-- regeneration caused by LSB jitter on a stationary craft.
-		local do_update = not gps_state.fix
-
-		if gps_state.fix then
-		    local d = fast_dist(gps_state.lat, gps_state.lon, cur_lat, cur_lon)
-
-		    -- GPS_MAX_JUMP rejects teleport jumps (receiver glitch / reboot)
-		    if d < GPS_MAX_JUMP then stats.total_dist = stats.total_dist + d end
-
-		    do_update = d > 2.0
-		end
-		if do_update then
-		    gps_state.lat_str       = string_fmt("%.6f", cur_lat)
-		    gps_state.lon_str       = string_fmt("%.6f", cur_lon)
-		    gps_state.plus_code     = to_plus_code(cur_lat, cur_lon)
-		    gps_state.plus_code_url = "OLC:" .. gps_state.plus_code
-		    gps_state.qr_cache      = generate_qrv2(cur_lat, cur_lon)
-		end
-	    end
-
-    	    gps_state.lat = cur_lat
-    	    gps_state.lon = cur_lon
-    	    gps_state.alt = alt
-    	    gps_state.fix = true
-
-	    if alt  > stats.max_alt   then stats.max_alt   = alt  end
-    	    if gspd > stats.max_speed then stats.max_speed = gspd end
-	end
+        if gps_state.sats >= MIN_SATS and is_valid_gps(cur_lat, cur_lon) then
+            update_gps_position(cur_lat, cur_lon, alt, gspd)
+        end
 
         if curr > stats.max_current then stats.max_current = curr end
         if capa > stats.mahdrain    then stats.mahdrain    = capa end
 
 	-- Vario: prefer direct VSpd sensor (INAV/BF); fall back to altitude delta.
 	-- Guard prev_alt ~= 0 avoids a spurious spike on the very first fix cycle.
-	local raw_vspd = _s.vspd and getValue(_s.vspd) or 0
+	local raw_vspd = sensors.vspd and getValue(sensors.vspd) or 0
 	if raw_vspd ~= 0 then
     	    gps_state.vspd = raw_vspd
 	elseif gps_state.fix and gps_state.prev_alt ~= 0 then
     	    gps_state.vspd = (alt - gps_state.prev_alt) / (UPDATE_RATE / CENTISECS_PER_SEC)
 	end
 	gps_state.prev_alt = alt
+    end
+
+    if ARM_SWITCH ~= "" then
+	local sv = getValue(ARM_SWITCH)
+	armed_display = sv ~= nil and sv == ARM_VALUE
+    elseif telemetry_live and sensors.fmode then
+	armed_display = fm_armed
+    else
+	armed_display = false
+    end
+
+    -- Flight time: count only when armed.
+    -- When no arm detection is available (no fmode, no ARM_SWITCH), counts
+    -- whenever the telemetry link is live — the only safe fallback.
+    if telemetry_live then
+	local no_arm_detect = not sensors.fmode and ARM_SWITCH == ""
+	if no_arm_detect or armed_display then
+    	    stats.flight_time = stats.flight_time + UPDATE_RATE
+	end
     end
 
     -- Cell count is re-inferred whenever pack voltage jumps more than 1 V.
@@ -1023,58 +1223,24 @@ local function background()
         end
     end
 
-    -- Bat cache: pre-format all display strings to avoid allocations inside draw functions
-    local bcfg              = BAT_CONFIG[bat_state.cfg_idx]
-    bat_state.rx_fmt        = string_fmt("%.2fV", bat_state.rx_bt)
-    bat_state.cell_fmt      = string_fmt("%.2fV", bat_state.cell_voltage)
-    bat_state.bat_tx_fmt    = string_fmt("%.1fV", bat_state.bat_tx)
-    bat_state.pct_val       = bat_state.cells > 0 and
-        math_max(0, math_min(1, (bat_state.cell_voltage - bcfg.v_min) / bcfg.v_range)) or 0
-    if bat_state.cells ~= bat_state.last_cells then
-	bat_state.last_cells    = bat_state.cells
-	bat_state.cell_s        = string_fmt("%dS", bat_state.cells)
-	bat_state.chem_cell_str = string_fmt("%s [%s]", bcfg.text,
-    	    bat_state.cells > 0 and bat_state.cell_s or "-S")
-    end
-
-    local pct = math_floor(bat_state.pct_val * 100)
-    if bat_state.cells > 0 and bat_state.curr > 0.5 then
-	local mins = math_floor(BAT_CAPACITY_MAH * bat_state.pct_val / bat_state.curr * 60 / 1000)
-	bat_state.pct_str = string_fmt("%d%% ~%dm", pct, mins)
-    else
-	bat_state.pct_str = string_fmt("%d%%", pct)
-    end
+    update_bat_strings()
 
     -- GPS cache: shared by the fixed-GPS info line and the waiting-for-fix screen
     if gps_state.alt ~= 0 then
-	gps_str_info = string_fmt("%s:%d%s %+.1f", BASE_TEXTS.altitude, math_floor(gps_state.alt * _alt_factor), _alt_unit, gps_state.vspd)
+	gps_str_info = string_fmt("%s:%d%s %+.1f", BASE_TEXTS.altitude, math_floor(gps_state.alt * alt_factor), alt_unit, gps_state.vspd)
     end
-    gps_sats_str = string_fmt("%s:%d", BASE_TEXTS.sats, gps_state.sats)
+    if gps_state.sats ~= last_sats then
+	last_sats   = gps_state.sats
+	gps_sats_str = string_fmt("%s:%d", BASE_TEXTS.sats, gps_state.sats)
+    end
 
-    -- TOT cache: pre-format all stats strings
-    tot_strs.l1_left  = string_fmt("%s:%.2fV", BASE_TEXTS.min_volt, stats.min_voltage)
-    tot_strs.l1_right = string_fmt("%s: %.1fA", BASE_TEXTS.max_cur, stats.max_current)
-    tot_strs.l2_left = string_fmt("%s: %.0f%s", BASE_TEXTS.max_alt,
-	stats.max_alt * _alt_factor, _alt_unit)
-    tot_strs.l2_right = string_fmt("%s: %s", BASE_TEXTS.distance, format_dist(stats.total_dist))
-    tot_strs.l3_left = string_fmt("%s: %.1f%s", BASE_TEXTS.max_spd,
-	stats.max_speed * _spd_factor, _spd_unit)
-    tot_strs.l3_right = string_fmt("%s: %d", BASE_TEXTS.max_sats, stats.max_sats)
-    tot_strs.l4_left = _capa_is_pct
-	and string_fmt("%s: %d%%",  BASE_TEXTS.mahdrain, stats.mahdrain)
-	or  string_fmt("%s: %dmAh", BASE_TEXTS.mahdrain, stats.mahdrain)
-    tot_strs.l4_right = string_fmt("%s: %d:%02d", BASE_TEXTS.flt_time,
-	math_floor(stats.flight_time / 6000),
-	math_floor(stats.flight_time / 100) % 60)
-    tot_strs.l5_left  = stats.min_lq == 999
-	and string_fmt("%s: --",   BASE_TEXTS.min_lq)
-	or  string_fmt("%s: %d%%", BASE_TEXTS.min_lq, stats.min_lq)
+    update_tot_strings()
 
     force_redraw      = true
 end
 
 -- ------------------------------------------------------------
--- 10. DRAWING FUNCTIONS
+-- 11. DRAWING FUNCTIONS
 -- ------------------------------------------------------------
 
 -- Draws the tab headers at the top of the screen.
@@ -1083,14 +1249,22 @@ local function draw_tabs()
     for i = 1, #TABS_LAYOUT do
         local tab = TABS_LAYOUT[i]
         if i == current_page then
-            -- active tab: solid background, inverted text
             lcd_drawFilledRect(tab.x, 0, tab.w, TAB_H, SOLID)
             lcd_drawText(tab.centerText_x, 1, tab.name, SMLSIZE + CENTER + INVERS)
         else
-            -- inactive tab: border only, normal text
             lcd_drawRect(tab.x, 0, tab.w, TAB_H, SOLID)
             lcd_drawText(tab.centerText_x, 1, tab.name, SMLSIZE + CENTER)
         end
+    end
+
+    -- Flight mode indicator: right of last tab
+    local fx = SCREEN_W - FM_AREA_W + math_floor(FM_AREA_W / 2)
+    if fm_str then
+	-- FM text: INVERS when armed, normal when disarmed
+	lcd_drawText(fx, 1, fm_str, SMLSIZE + CENTER + (armed_display and INVERS or 0))
+    elseif ARM_SWITCH ~= "" and armed_display then
+	-- No FM: show "ARM" centered, always normal (no inversion)
+	lcd_drawText(fx, 1, "ARM", SMLSIZE + CENTER)
     end
 end
 
@@ -1179,6 +1353,7 @@ local function draw_tot_page()
     lcd_drawText(0, LAYOUT.tot_line4_y, tot_strs.l4_left, SMLSIZE)
     lcd_drawText(SCREEN_W, LAYOUT.tot_line4_y, tot_strs.l4_right, SMLSIZE + RIGHT)
     lcd_drawText(0, LAYOUT.tot_line5_y, tot_strs.l5_left,  SMLSIZE)
+    lcd_drawText(SCREEN_W, LAYOUT.tot_line5_y, tot_strs.l5_right, SMLSIZE + RIGHT)
 end
 
 -- Draws the LOC page
@@ -1198,19 +1373,26 @@ local function draw_loc_page(blink_on)
 
     local dbl_y  = CONTENT_Y + 9
     local sml_y  = dbl_y + 6
-    lcd_drawText(SCREEN_CENTER_X, dbl_y, string_fmt("%d dB", loc_sig), DBLSIZE + CENTER)
-    lcd_drawText(2,               sml_y, loc_tpwr and string_fmt("%dmW", loc_tpwr) or "?mW", FONT_INFO)
-    lcd_drawText(SCREEN_W - 2,    sml_y, string_fmt("%d%%", math_floor(loc_sig_pct)), FONT_INFO + RIGHT)
+    lcd_drawText(SCREEN_CENTER_X, dbl_y, loc_sig_fmt,  DBLSIZE + CENTER)
+    lcd_drawText(2,               sml_y, loc_tpwr_fmt, FONT_INFO)
+    lcd_drawText(SCREEN_W - 2,    sml_y, loc_pct_fmt,  FONT_INFO + RIGHT)
 
     local cells_filled = math_floor(loc_sig_pct * LAYOUT.loc_cell_n / 100)
+
     for i = 0, LAYOUT.loc_cell_n - 1 do
-        local cx = 2 + i * LAYOUT.loc_cell_w
-        lcd_drawRect(cx, LAYOUT.loc_cell_y,
-            LAYOUT.loc_cell_w - 1, LAYOUT.loc_cell_h, SOLID)
-        if i < cells_filled then
-            lcd_drawFilledRect(cx + 1, LAYOUT.loc_cell_y + 1,
-                LAYOUT.loc_cell_w - 3, LAYOUT.loc_cell_h - 2, SOLID)
-        end
+	local cx = 2 + i * LAYOUT.loc_cell_w
+	lcd_drawRect(cx, LAYOUT.loc_cell_y, LAYOUT.loc_cell_bw, LAYOUT.loc_cell_h, SOLID)
+	if i < cells_filled then
+    	    lcd_drawFilledRect(cx + 1, LAYOUT.loc_cell_y + 1,
+        	LAYOUT.loc_cell_iw, LAYOUT.loc_cell_ih, SOLID)
+	end
+    end
+
+    -- Peak marker: thin filled mark at peak cell position (only if above current)
+    if loc_peak_pct > loc_sig_pct then
+	local pcx = 2 + math_floor(loc_peak_pct * (LAYOUT.loc_cell_n - 1) / 100) * LAYOUT.loc_cell_w
+	lcd_drawFilledRect(pcx + LAYOUT.loc_peak_off,
+    	    LAYOUT.loc_cell_y + 1, 2, LAYOUT.loc_cell_ih, SOLID)
     end
 end
 
@@ -1243,11 +1425,385 @@ local function draw_cfg_page(blink_on)
     end
 end
 
-local last_blink_state = false
+-- Displays a centered notification banner for TOAST_DURATION centiseconds.
+-- Recalculates the banner width and horizontal position on every call to
+-- fit variable-length messages. The vertical position (toast_layout.y) is
+-- pre-computed once in init() and never changes. The banner is rendered
+-- by run() as an overlay on top of the active page, and dismissed
+-- automatically once (getTime() - toast_time) >= TOAST_DURATION.
+-- Calling show_toast() again before the previous toast expires replaces
+-- it immediately and resets the timer.
+local function show_toast(msg)
+    toast_msg = msg
+    toast_time = getTime()
+
+    local msg_w = math_max(#toast_msg * 6 + 10, 60)
+    toast_layout.w = msg_w
+    toast_layout.x = math_floor((SCREEN_W - msg_w) / 2)
+end
 
 -- ------------------------------------------------------------
--- 11. MAIN FUNCTION
+-- 12. EVENT & RELATED FUNCTIONS
 -- ------------------------------------------------------------
+
+-- Serialises all user-configurable runtime variables to a fixed-format CSV
+-- file on the SD card (CFG_FILE). Field order is fixed and must stay in sync
+-- with load_config(). The ARM_SWITCH name is stored as a 1-based index into
+-- ARM_SW_LIST ("SA"=1 … "SH"=8); 0 means no switch configured. Called
+-- automatically when the config overlay closes after any change
+-- (cfg_changed == true), and from handle_cfg_events() on EXIT. Safe to call
+-- at any time; silently does nothing if the file cannot be opened.
+local function save_config()
+    local file = io.open(CFG_FILE, "w")
+    local arm_idx = 0
+    for i, sw in ipairs(ARM_SW_LIST) do
+	if sw == ARM_SWITCH then arm_idx = i; break end
+    end
+    if file then
+	io.write(file, string_fmt("%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
+	    UPDATE_RATE, BATTERY_ALERT_ENABLED and 1 or 0,
+	    BATTERY_ALERT_AUDIO and 1 or 0,
+	    BATTERY_ALERT_INTERVAL,
+	    math_floor(BATTERY_ALERT_STEP * 100),
+	    SAG_CURRENT_THRESHOLD,
+	    math_floor(TX_BAT_WARN * 10),
+	    TOAST_DURATION, BAT_CAPACITY_MAH, MIN_SATS,
+	    HAPTIC and 1 or 0, AUTO_TAB and 1 or 0, arm_idx,
+	    ARM_VALUE))
+        io.close(file)
+    end
+end
+
+-- Handles touch-screen tab navigation for radios that support EVT_TOUCH_FIRST
+-- (TX16S, Boxer, etc.). Reads the touch coordinates and switches current_page
+-- when the tap falls within the tab bar area. Returns 0 to consume the event.
+local function handle_touch_nav()
+    if getTouchState then
+        local touch = getTouchState()
+        if touch and touch.y <= TAB_H then
+            local tapped = math_floor(touch.x / TAB_W) + 1
+            if tapped <= #TABS then current_page = tapped end
+        end
+    end
+    return 0
+end
+
+-- Toggles the config overlay open or closed on EVT_VIRTUAL_MENU_LONG.
+-- Refreshes displayed cfg values on open; exits edit mode and auto-saves
+-- to SD card on close if any setting was modified during the session.
+-- Returns 0 to consume the event.
+local function handle_cfg_toggle()
+    show_cfg = not show_cfg
+    if show_cfg then
+        refresh_cfg_vals()
+    else
+        cfg_edit = false
+        sw_listen = false
+        sw_pending = ""
+	cfg_edit_snapshot = nil
+        if cfg_changed then
+            save_config()
+            cfg_changed = false
+        end
+    end
+    return 0
+end
+
+-- Commits the current arm-switch capture session and clears the listen state.
+-- If a switch was identified during the scan (sw_pending ~= ""), stores it as
+-- ARM_SWITCH / ARM_VALUE and marks the config dirty. Always clears sw_listen
+-- and sw_pending regardless of whether a switch was captured, so the UI
+-- returns to normal edit mode. Callers are responsible for calling
+-- refresh_cfg_vals() afterwards to reflect the updated ARM_SWITCH value.
+local function confirm_sw_listen()
+    if sw_pending ~= "" then
+        ARM_SWITCH  = sw_pending
+        ARM_VALUE   = sw_pending_val
+        cfg_changed = true
+    end
+    sw_listen  = false
+    sw_pending = ""
+end
+
+-- Handles all keyboard and rotary events while the config overlay is visible.
+-- Covers: EXIT to close or cancel an active sw-listen session, rotary navigation
+-- between items, ENTER to enter or exit edit mode, value adjustment for each
+-- config item, and cfg_scroll synchronisation with the selected item.
+-- Returns 0 to consume every event routed through it.
+local function handle_cfg_events(event)
+    if event == EVT_EXIT_BREAK and not cfg_edit then
+        show_cfg = false
+        if cfg_changed then save_config(); cfg_changed = false end
+        return 0
+    end
+
+    if not cfg_edit then
+        if event == EVT_ROT_RIGHT or event == EVT_PLUS_FIRST then
+            cfg_sel = cycle(cfg_sel, #cfg_items, 1)
+        elseif event == EVT_ROT_LEFT or event == EVT_MINUS_FIRST then
+            cfg_sel = cycle(cfg_sel, #cfg_items, -1)
+        elseif event == EVT_ENTER_BREAK then
+            if cfg_sel == 13 then
+                if sw_listen then
+                    confirm_sw_listen()
+                    refresh_cfg_vals()
+                else
+                    for _, sw in ipairs(ARM_SW_LIST) do
+                        sw_snapshot[sw] = getValue(sw) or 0
+                    end
+                    sw_pending = ""
+                    sw_listen = true
+                    cfg_edit = true
+                    refresh_cfg_vals()
+                end
+            else
+                if     cfg_sel == 1  then cfg_edit_snapshot = UPDATE_RATE
+                elseif cfg_sel == 2  then cfg_edit_snapshot = BATTERY_ALERT_ENABLED
+                elseif cfg_sel == 3  then cfg_edit_snapshot = BATTERY_ALERT_AUDIO
+                elseif cfg_sel == 4  then cfg_edit_snapshot = BATTERY_ALERT_INTERVAL
+                elseif cfg_sel == 5  then cfg_edit_snapshot = BATTERY_ALERT_STEP
+                elseif cfg_sel == 6  then cfg_edit_snapshot = SAG_CURRENT_THRESHOLD
+                elseif cfg_sel == 7  then cfg_edit_snapshot = TX_BAT_WARN
+                elseif cfg_sel == 8  then cfg_edit_snapshot = TOAST_DURATION
+                elseif cfg_sel == 9  then cfg_edit_snapshot = BAT_CAPACITY_MAH
+                elseif cfg_sel == 10 then cfg_edit_snapshot = MIN_SATS
+                elseif cfg_sel == 11 then cfg_edit_snapshot = HAPTIC
+                elseif cfg_sel == 12 then cfg_edit_snapshot = AUTO_TAB
+                end
+                cfg_edit = true
+            end
+        end
+    else
+        -- In edit mode
+        if event == EVT_ENTER_BREAK then
+            if cfg_sel == 13 and sw_listen then
+                confirm_sw_listen()
+                refresh_cfg_vals()
+            end
+            cfg_edit_snapshot = nil
+            cfg_edit = false
+        elseif event == EVT_EXIT_BREAK then
+            if cfg_sel == 13 and sw_listen then
+                sw_listen = false
+                sw_pending = ""
+                refresh_cfg_vals()
+            elseif cfg_edit_snapshot ~= nil then
+                cfg_set_var(cfg_sel, cfg_edit_snapshot)   -- restore original value
+                cfg_edit_snapshot = nil
+                refresh_cfg_vals()
+            end
+            cfg_edit = false
+        elseif event == EVT_ROT_RIGHT or event == EVT_PLUS_FIRST or
+               event == EVT_ROT_LEFT  or event == EVT_MINUS_FIRST then
+            if cfg_sel ~= 13 then
+                local dir = (event == EVT_ROT_RIGHT or event == EVT_PLUS_FIRST) and 1 or -1
+                local nv
+                if     cfg_sel == 1  then nv = math_max(10,   math_min(500,   UPDATE_RATE            + 10    * dir))
+                elseif cfg_sel == 2  then nv = not BATTERY_ALERT_ENABLED
+                elseif cfg_sel == 3  then nv = not BATTERY_ALERT_AUDIO
+                elseif cfg_sel == 4  then nv = math_max(0,    math_min(10000, BATTERY_ALERT_INTERVAL + 100   * dir))
+                elseif cfg_sel == 5  then nv = math_max(0.05, math_min(1.0,   BATTERY_ALERT_STEP     + 0.05  * dir))
+                elseif cfg_sel == 6  then nv = math_max(5,    math_min(100,   SAG_CURRENT_THRESHOLD  + 5     * dir))
+                elseif cfg_sel == 7  then nv = TX_BAT_WARN > 0 and 0 or bat_warn_default
+                elseif cfg_sel == 8  then nv = math_max(50,   math_min(500,   TOAST_DURATION         + 50    * dir))
+                elseif cfg_sel == 9  then nv = math_max(100,  math_min(20000, BAT_CAPACITY_MAH       + 100   * dir))
+                elseif cfg_sel == 10 then nv = math_max(3,    math_min(8,     MIN_SATS               + dir))
+                elseif cfg_sel == 11 then nv = not HAPTIC
+                elseif cfg_sel == 12 then nv = not AUTO_TAB
+                end
+                if nv ~= nil then
+            	    cfg_set_var(cfg_sel, nv)
+            	    cfg_changed = true
+            	end
+                refresh_cfg_vals()
+            end
+        end
+    end
+
+    if cfg_sel > cfg_scroll + LAYOUT.cfg_visible then
+        cfg_scroll = cfg_sel - LAYOUT.cfg_visible
+    elseif cfg_sel <= cfg_scroll then
+        cfg_scroll = cfg_sel - 1
+    end
+
+    return 0
+end
+
+-- Handles EVT_ENTER_BREAK on the four main pages (outside the config overlay).
+-- BAT: cycles through battery chemistry types and updates threshold strings.
+-- GPS: triggers a screenshot if a GPS fix and QR code are available.
+-- TOT: resets all flight statistics to their default values.
+-- LOC: toggles the locator active state; clears signal cache on deactivation.
+local function handle_page_enter()
+    if current_page == 1 then
+        bat_state.cfg_idx = (bat_state.cfg_idx % #BAT_CONFIG) + 1
+        local bcfg = BAT_CONFIG[bat_state.cfg_idx]
+        bat_state.threshold     = bcfg.volt
+        bat_state.lbl_vmin      = string_fmt("%.2fV", bcfg.v_min)
+        bat_state.lbl_vmax      = string_fmt("%.2fV", bcfg.v_max)
+        bat_state.chem_cell_str = string_fmt("%s [%s]", bcfg.text,
+            bat_state.cells > 0 and bat_state.cell_s or "-S")
+        show_toast(string_fmt("** %s (%.1fV) **", bcfg.text, bat_state.threshold))
+	bat_state.last_volt = bat_state.rx_bt + 2.0
+	bat_state.last_cells = -1
+    elseif current_page == 2 then
+        if gps_state.fix then
+            if type(screenshot) == "function" then screenshot() end
+            show_toast(toast_shot)
+        end
+    elseif current_page == 3 then
+        reset_stats()
+        show_toast(toast_resetted)
+    elseif current_page == 4 then
+        loc_active = not loc_active
+        if not loc_active then
+            loc_next_play = 0
+            loc_sig       = nil
+            loc_peak_pct  = 0
+        end
+    end
+end
+
+-- ------------------------------------------------------------
+-- 13. MAIN (RUN) & RELATED FUNCTIONS
+-- ------------------------------------------------------------
+
+-- Normalises a raw LOC sensor reading to a 0–100% signal strength value.
+-- Returns 0 immediately when sig is nil (no sensor read).
+-- Two scaling modes depending on loc_is_elrs:
+--   · ELRS (1RSS/2RSS): segmented dBm mapping using LOC_SEG_NEAR (-15 dBm)
+--     and LOC_SEG_FAR (-70 dBm) as boundaries. Values at or above
+--     LOC_SEG_NEAR return 100; at or below LOC_SEG_FAR return 10 (never 0,
+--     to distinguish a weak-but-present signal from no signal at all).
+--     Values in between are linearly interpolated into the 10–100 range.
+--   · RSSI: direct 0–100 passthrough clamped to [0, 100].
+-- Output drives bar fill, beep rate, haptic intensity and the peak marker
+-- in draw_loc_page() and update_loc_sensor().
+local function loc_normalise(sig)
+    if not sig then return 0 end
+    if loc_is_elrs then
+        -- dBm → 0–100, using LOC_SEG_NEAR/LOC_SEG_FAR
+        if     sig >= LOC_SEG_NEAR then return 100
+        elseif sig <= LOC_SEG_FAR  then return 10
+        else
+            return math_floor((sig - LOC_SEG_FAR) * 90 / (LOC_SEG_NEAR - LOC_SEG_FAR) + 10)
+        end
+    else
+        -- RSSI 0–100 direct
+        return math_max(0, math_min(100, sig))
+    end
+end
+
+-- Returns the raw signal value from the active LOC sensor, or nil if
+-- unavailable. Reads the sensor name resolved by detect_sensors() (sensors.loc),
+-- which is one of: 1RSS or 2RSS (ELRS, value in dBm, negative) or RSSI
+-- (value 0–100). Returns nil when the sensor is not present (sensors.loc == nil)
+-- or when the reading is exactly 0, treating zero as the no-signal sentinel
+-- rather than a valid measurement. Callers must check for nil before
+-- passing the result to loc_normalise().
+local function loc_get_signal()
+    if not sensors.loc then return nil end
+    local v = getValue(sensors.loc)
+    return v ~= 0 and v or nil
+end
+
+-- Fires a two-tier battery low-voltage alert when cell voltage drops below
+-- the configured threshold. Tier 1 enforces a minimum time gap between alerts
+-- (BATTERY_ALERT_INTERVAL). Tier 2 requires a minimum additional voltage drop
+-- (BATTERY_ALERT_STEP) since the last alert. Both tiers must be satisfied
+-- simultaneously to prevent alert spam during voltage sag under load.
+-- All alerts are suppressed when current draw exceeds SAG_CURRENT_THRESHOLD.
+local function update_battery_alert(current_time)
+    if not BATTERY_ALERT_ENABLED or bat_state.cells == 0
+        or bat_state.curr > SAG_CURRENT_THRESHOLD then return end
+
+    if bat_state.cell_voltage < bat_state.threshold then
+        if bat_state.alert_volt == 0 or
+            (current_time - bat_state.alert_time >= BATTERY_ALERT_INTERVAL and
+             bat_state.alert_volt - bat_state.cell_voltage >= BATTERY_ALERT_STEP) then
+            if BATTERY_ALERT_AUDIO then playNumber(math_floor(bat_state.cell_voltage * 10), 0, PREC1) end
+            if HAPTIC and playHaptic then playHaptic(15, 0, 1) end
+            bat_state.alert_time = current_time
+            bat_state.alert_volt = bat_state.cell_voltage
+        end
+    else
+        if bat_state.alert_volt ~= 0 then
+            bat_state.alert_time = current_time
+            bat_state.alert_volt = 0
+        end
+    end
+end
+
+-- Continuously monitors all ARM_SW_LIST switches during Phase 1 (scan) or
+-- the selected switch during Phase 2 (track) of the arm-switch capture process.
+-- Phase 1 detects the first switch that moves from the snapshot baseline and
+-- promotes it to sw_pending. Phase 2 tracks live value changes and updates
+-- the display via refresh_cfg_vals(). Called from run() every frame while
+-- sw_listen is true.
+local function track_sw_listen()
+    if sw_pending ~= "" then
+        -- Phase 2: switch already identified → track its current value (allows mid position)
+        local v = getValue(sw_pending) or 0
+        if v ~= sw_pending_val then
+            sw_pending_val = v
+            refresh_cfg_vals()
+            force_redraw = true
+        end
+    else
+        -- Phase 1: detect which switch moved from the snapshot
+        local changed_sw, changed_val
+        for _, sw in ipairs(ARM_SW_LIST) do
+            local v = getValue(sw) or 0
+            if v ~= sw_snapshot[sw] then
+                changed_sw, changed_val = sw, v
+                break
+            end
+        end
+        if changed_sw then
+            sw_pending     = changed_sw
+            sw_pending_val = changed_val
+            refresh_cfg_vals()
+            force_redraw = true
+        end
+    end
+end
+
+-- Reads and caches the LOC signal and TX power every run() frame while the
+-- locator is active. Normalises the raw value to 0–100%, updates the peak
+-- hold percentage, and triggers a forced redraw only when signal or TX power
+-- changes. Fires a proximity beep tone (and haptic if enabled) at a rate that
+-- shrinks linearly from LOC_BEEP_MAX_CS (weak) to LOC_BEEP_MIN_CS (strong).
+local function update_loc_sensor(current_time)
+    local s        = loc_get_signal()
+    local tpwr_raw = sensors.tpwr and getValue(sensors.tpwr) or nil
+
+    loc_sig_pct = loc_normalise(s)
+    if s and loc_sig_pct > loc_peak_pct then
+        loc_peak_pct = loc_sig_pct
+    end
+
+    if s ~= loc_sig or tpwr_raw ~= loc_tpwr then
+        loc_sig  = s
+        loc_tpwr = tpwr_raw
+        if s then
+            loc_sig_fmt = string_fmt("%d dB", s)
+            loc_pct_fmt = string_fmt("%d%%", math_floor(loc_sig_pct))
+        end
+        loc_tpwr_fmt = tpwr_raw and string_fmt("%dmW", tpwr_raw) or "?mW"
+        force_redraw = true
+    end
+
+    if current_time >= loc_next_play then
+        if loc_sig then
+            playTone(math_floor(400 + loc_sig_pct * 6), 80, 0, PLAY_NOW)
+            if HAPTIC and playHaptic then playHaptic(7, 0, 1) end
+        end
+        loc_next_play = current_time + math_floor(LOC_BEEP_MAX_CS - LOC_BEEP_RANGE * loc_sig_pct / 100)
+    end
+end
+
+-- ------------------------------------------------------------
+
 local function run(event)
     if event ~= 0 then
         force_redraw = true
@@ -1255,148 +1811,33 @@ local function run(event)
         -- Touch-screen tab navigation (TX16S, Boxer, and other touch-capable radios).
         -- EVT_TOUCH_FIRST is nil on button-only radios, so the outer guard is safe.
 	if EVT_TOUCH_FIRST and event == EVT_TOUCH_FIRST and not show_cfg then
-	    if getTouchState then
-    		local touch = getTouchState()
-    		if touch and touch.y <= TAB_H then
-        	    local tapped = math_floor(touch.x / TAB_W) + 1
-        	    if tapped >= 1 and tapped <= #TABS then current_page = tapped end
-    		end
-	    end
-	    return 0
+            return handle_touch_nav()
 	end
 
         -- Toggle config overlay; auto-save on close if settings were modified
-	if event == EVT_VIRTUAL_MENU_LONG then
-            show_cfg = not show_cfg
-	    if show_cfg then refresh_cfg_vals() end
-            if not show_cfg then
-                cfg_edit = false  -- always exit edit mode when closing
-                if cfg_changed then
-                    save_config() -- save changes to SD card
-                    cfg_changed = false
-                end
-            end
-            return 0
-        end
+        if event == EVT_VIRTUAL_MENU_LONG then return handle_cfg_toggle() end
 
-        -- Block all other events until toggled off, but allow navigation
-        if show_cfg then
-	    if event == EVT_EXIT_BREAK and not cfg_edit then
-    		show_cfg = false
-    		if cfg_changed then
-        	    save_config()
-        	    cfg_changed = false
-    		end
-    		return 0
-	    end
-            if not cfg_edit then
-		if event == EVT_ROT_RIGHT or event == EVT_PLUS_FIRST then
-		    cfg_sel = cycle(cfg_sel, #cfg_items,  1)
-		elseif event == EVT_ROT_LEFT or event == EVT_MINUS_FIRST then
-		    cfg_sel = cycle(cfg_sel, #cfg_items, -1)
-                elseif event == EVT_ENTER_BREAK then
-                    cfg_edit = true
-                end
-            else
-                -- In edit mode
-                if event == EVT_ENTER_BREAK or event == EVT_EXIT_BREAK then
-                    cfg_edit = false
-		elseif event == EVT_ROT_RIGHT or event == EVT_PLUS_FIRST or
-    			event == EVT_ROT_LEFT  or event == EVT_MINUS_FIRST then
-		    cfg_changed = true
-		    local dir = (event == EVT_ROT_RIGHT or event == EVT_PLUS_FIRST) and 1 or -1
-		    if cfg_sel == 1 then
-    			UPDATE_RATE = math_max(10, math_min(500, UPDATE_RATE + 10 * dir))
-		    elseif cfg_sel == 2 then
-    			BATTERY_ALERT_ENABLED = not BATTERY_ALERT_ENABLED
-		    elseif cfg_sel == 3 then
-    			BATTERY_ALERT_AUDIO = not BATTERY_ALERT_AUDIO
-		    elseif cfg_sel == 4 then
-    			BATTERY_ALERT_INTERVAL = math_max(0, math_min(10000, BATTERY_ALERT_INTERVAL + 100 * dir))
-		    elseif cfg_sel == 5 then
-    			BATTERY_ALERT_STEP = math_max(0.05, math_min(1.0, BATTERY_ALERT_STEP + 0.05 * dir))
-		    elseif cfg_sel == 6 then
-    			SAG_CURRENT_THRESHOLD = math_max(5, math_min(100, SAG_CURRENT_THRESHOLD + 5 * dir))
-		    elseif cfg_sel == 7 then
-			TX_BAT_WARN = TX_BAT_WARN > 0 and 0 or _bat_warn_default
-		    elseif cfg_sel == 8 then
-			TOAST_DURATION = math_max(50, math_min(500, TOAST_DURATION + 50 * dir))
-		    elseif cfg_sel == 9 then
-			BAT_CAPACITY_MAH = math_max(100, math_min(20000, BAT_CAPACITY_MAH + 100 * dir))
-		    elseif cfg_sel == 10 then
-			MIN_SATS = math_max(3, math_min(8, MIN_SATS + dir))
-		    elseif cfg_sel == 11 then
-			HAPTIC = not HAPTIC
-		    end
-		    refresh_cfg_vals()
-                end
-            end
-
-	    if cfg_sel > cfg_scroll + LAYOUT.cfg_visible then
-    		cfg_scroll = cfg_sel - LAYOUT.cfg_visible
-	    elseif cfg_sel <= cfg_scroll then
-    		cfg_scroll = cfg_sel - 1
-	    end
-
-            return 0
-        end
+        if show_cfg then return handle_cfg_events(event) end
 
 	if event == EVT_ROT_RIGHT or event == EVT_PLUS_BREAK then
 	    current_page = cycle(current_page, #TABS,  1)
 	elseif event == EVT_ROT_LEFT or event == EVT_MINUS_BREAK then
 	    current_page = cycle(current_page, #TABS, -1)
-	elseif event == EVT_ENTER_BREAK then
-            if current_page == 1 then
-                bat_state.cfg_idx = (bat_state.cfg_idx % #BAT_CONFIG) + 1
-                local bcfg = BAT_CONFIG[bat_state.cfg_idx]
-                bat_state.threshold = bcfg.volt
-                bat_state.lbl_vmin = string_fmt("%.2fV", bcfg.v_min)
-                bat_state.lbl_vmax = string_fmt("%.2fV", bcfg.v_max)
-		bat_state.chem_cell_str = string_fmt("%s [%s]", bcfg.text,
-		    bat_state.cells > 0 and bat_state.cell_s or "-S")
-                show_toast(string_fmt("** %s (%.1fV) **", bcfg.text, bat_state.threshold))
-            elseif current_page == 2 then
-                if type(screenshot) == "function" then
-                    screenshot()
-                end
-                show_toast(string_fmt("** %s **", BASE_TEXTS.shot))
-            elseif current_page == 3 then
-                reset_stats()
-		show_toast(string_fmt("** %s **", BASE_TEXTS.resetted))
-	    elseif current_page == 4 then
-		loc_active = not loc_active
-	        if not loc_active then loc_next_play = 0; loc_sig = nil end
-            end
+        elseif event == EVT_ENTER_BREAK then
+    	    handle_page_enter()
         end
     end
 
-    -- Battery alert logic. Two-tier re-alert logic:
-    --   Tier 1 (time): re-alert only after BATTERY_ALERT_INTERVAL centiseconds
-    --                  have elapsed since the last alert.
-    --   Tier 2 (step): re-alert only if voltage has dropped at least
-    --                  BATTERY_ALERT_STEP volts since the last alert.
-    -- Both conditions must be true simultaneously. This prevents spamming
-    -- alerts when voltage fluctuates around the threshold under sag.
-    -- SAG_CURRENT_THRESHOLD suppresses all alerts during high-current draws
-    -- where temporary voltage sag is expected and non-critical.
     local current_time = getTime()
-    if BATTERY_ALERT_ENABLED and bat_state.cells > 0 and bat_state.curr <= SAG_CURRENT_THRESHOLD then
-        if bat_state.cell_voltage < bat_state.threshold then
-            if bat_state.alert_volt == 0 or
-                (current_time - bat_state.alert_time >= BATTERY_ALERT_INTERVAL and bat_state.alert_volt - bat_state.cell_voltage >= BATTERY_ALERT_STEP) then
-                if BATTERY_ALERT_AUDIO then
-                    playNumber(math_floor(bat_state.cell_voltage * 10), 0, PREC1)
-                end
-                bat_state.alert_time = current_time
-                bat_state.alert_volt = bat_state.cell_voltage
-            end
-        else
-	    if bat_state.alert_volt ~= 0 then
-    		bat_state.alert_time = current_time
-    		bat_state.alert_volt = 0
-	    end
-        end
+    update_battery_alert(current_time)
+
+    -- Auto-tab: falling edge of telemetry_live → jump to GPS (if had fix) or LOC
+    if prev_telem_live and not telemetry_live and AUTO_TAB then
+	current_page = gps_state.fix and 2 or 4
     end
+    prev_telem_live = telemetry_live
+
+    if sw_listen then track_sw_listen() end
 
     -- blink_on toggles at 1 Hz by testing bit 0 of (time / 100cs).
     -- Redraws are forced on every state change to avoid stale frames.
@@ -1413,52 +1854,7 @@ local function run(event)
     end
 
     -- Locator
-    if current_page == 4 and loc_active then
-	-- Signal Cache
-	local s = loc_get_signal()
-	local tpwr_raw = getFieldInfo("TPWR") and getValue("TPWR") or nil
-
-	-- ELRS uses segmented dBm scaling with two linear zones:
-	--   Zone 1 (noise floor → FAR): maps -115..LOC_SEG_FAR  → 0..10%
-	--   Zone 2 (FAR → near):        maps LOC_SEG_FAR..LOC_SEG_NEAR → 10..100%
-	-- The two-zone model gives higher resolution in the useful mid-range
-	-- while still showing movement at the extreme far end.
-	-- Non-ELRS links report 0-100 directly; no remapping needed.
-	if s then
-	    if _loc_is_elrs then
-		-- segmented: -115..LOC_SEG_FAR = 0..10% | LOC_SEG_FAR..LOC_SEG_NEAR = 10..100%
-		if s >= LOC_SEG_NEAR then
-    		    loc_sig_pct = 100
-		elseif s <= LOC_SEG_FAR then
-    		    loc_sig_pct = math_max(0, 10 * (s - (-115)) / (LOC_SEG_FAR - (-115)))
-		else
-    		    loc_sig_pct = 10 + 90 * (s - LOC_SEG_FAR) / (LOC_SEG_NEAR - LOC_SEG_FAR)
-		end
-	    else
-    		loc_sig_pct = math_max(0, math_min(100, s))
-	    end
-	else
-	    loc_sig_pct   = 0
-	end
-
-	-- Force redraw only when signal or TX power actually changes.
-	if s ~= loc_sig or tpwr_raw ~= loc_tpwr then
-    	    loc_sig   = s
-    	    loc_tpwr  = tpwr_raw
-    	    force_redraw = true
-	end
-
-	-- Beep
-	local now = getTime()
-	if now >= loc_next_play then
-    	    if loc_sig then
-        	playTone(math_floor(400 + loc_sig_pct * 6), 80, 0, PLAY_NOW)
-        	if HAPTIC and playHaptic then playHaptic(7, 0, 1) end
-    	    end
-	    -- interval shrinks linearly from LOC_BEEP_MAX_CS (weak signal) to LOC_BEEP_MIN_CS (strong signal)
-    	    loc_next_play = now + math_floor(LOC_BEEP_MAX_CS - (LOC_BEEP_MAX_CS - LOC_BEEP_MIN_CS) * loc_sig_pct / 100)
-	end
-    end
+    if current_page == 4 and loc_active then update_loc_sensor(current_time) end
 
     if not force_redraw then return 0 end
     force_redraw = false
@@ -1482,5 +1878,7 @@ local function run(event)
 
     return 0
 end
+
+-- ------------------------------------------------------------
 
 return { init = init, background = background, run = run }

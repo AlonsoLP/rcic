@@ -1,5 +1,9 @@
 # RCIC (RC Info Center) - Telemetry Dashboard for EdgeTX
 
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/d57b3e07-3253-45db-b4e3-b29efeb48ab9">
+</p>
+
 **RC Info Center (RCIC)** is a highly optimized, full-featured telemetry script designed for radio transmitters running **EdgeTX 2.9 or higher** (and compatible OpenTX). It provides a multifunctional tabbed dashboard, real-time configurable battery alerts, GPS coordinate validation, an integrated drone locator, and fast local QR/OLC generation.
 
 ![EdgeTX](https://img.shields.io/badge/EdgeTX-2.9%2B-blue)

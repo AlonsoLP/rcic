@@ -2,7 +2,7 @@
 -- rcic.lua — RC Info Center
 --
 -- Version: 4.0
--- Date:    2026-03-22
+-- Date:    2026-03-26
 -- Author:  Alonso Lara (github.com/AlonsoLP)
 --
 -- Description:

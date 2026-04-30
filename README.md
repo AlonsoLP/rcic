@@ -1,4 +1,4 @@
-# RCIC (RC Info Center) v4.0 - Advanced Telemetry Suite for EdgeTX
+# RCIC (RC Info Center) - Advanced Telemetry Suite for EdgeTX
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/d57b3e07-3253-45db-b4e3-b29efeb48ab9">
@@ -24,7 +24,7 @@ RCIC provides a highly modular 7-tab dashboard, real-time battery analytics, GPX
 
 ## 🚀 Quick Installation
 
-Installing RCIC v4.0 requires copying two files to your SD card:
+Installing RCIC requires copying two files to your SD card:
 
 1. Download the latest release from the repository.
 2. Copy `rcic.lua` to your radio's SD card under `/SCRIPTS/TELEMETRY/`.

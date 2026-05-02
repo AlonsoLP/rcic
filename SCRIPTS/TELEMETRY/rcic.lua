@@ -1,8 +1,8 @@
 -- =========================================================================
 -- rcic.lua — RC Info Center
 --
--- Version: 4.0
--- Date:    2026-03-26
+-- Version: 4.1
+-- Date:    2026-04-28
 -- Author:  Alonso Lara (github.com/AlonsoLP)
 --
 -- Description:
@@ -81,9 +81,10 @@ local LOC_BEEP_RANGE    = 180         -- span between fastest (20 cs) and slowes
 -- LOC_SEG_NEAR: at or above this value the bar reads 100%.
 -- LOC_SEG_FAR : at or below this value the bar is clamped to 10% (never 0%,
 --               to distinguish "weak signal" from "no signal").
-local LOC_SEG_NEAR      = -15         -- & up: 100%
-local LOC_SEG_FAR       = -70         -- & below: 10%
-local LOC_SEG_RANGE     = LOC_SEG_NEAR - LOC_SEG_FAR
+local LOC_SEG_NEAR           = -15         -- & up: 100%
+local LOC_SEG_FAR            = -70         -- & below: 10%
+local LOC_SEG_RANGE          = LOC_SEG_NEAR - LOC_SEG_FAR
+local BATTERY_STABILIZE_TIME = 300         -- (3s) suppress alerts after a >1V jump (battery connect/swap)
 
 -- Flattened battery config to eliminate nested table RAM overhead
 local BAT_CFG_TEXT = { "LiPo", "LiHV", "LiIon" }
@@ -117,7 +118,6 @@ local CFG_FILE = "/SCRIPTS/TELEMETRY/rcic.cfg" -- shared CSV config file; read b
 
 -- Standard Lua
 local math_floor         = math.floor
-local math_abs           = math.abs
 local math_max           = math.max
 local math_min           = math.min
 local math_cos           = math.cos
@@ -210,19 +210,24 @@ local sensors = {}
 -- changes how mahdrain is formatted in update_tot_strings() and pwr_strs[4]
 local capa_is_pct = false
 
--- true when the LOC sensor resolved to an ELRS antenna (1RSS or 2RSS);
+-- true when the sensor resolved to an ELRS antenna (1RSS or 2RSS);
 -- selects dBm-based scaling in loc_normalise() instead of 0–100 passthrough
-local loc_is_elrs = false
+local link_is_elrs = false
 
 local gps_state = {
-    lat = 0, lon = 0, alt = 0, fix = false,
-    lat_str = "0.000000", lon_str = "0.000000", plus_code = "---",
+    lat = 0, lon = 0, alt = 0,
+    fix = false,
+    had_fix = false,   -- latched true once a valid fix is acquired; never resets (distinguishes "waiting" from "lost")
+    lat_str = "0.000000", lon_str = "0.000000",
+    plus_code = "---",
     sats = 0, vspd = 0, prev_alt = 0, hdop = 0, hdop_str = "HDOP:--"
 }
 
 local bat_state = {
     cells        = 0,   -- detected cell count (0 = unknown; re-detected on >1 V pack voltage change)
+    identified   = false,   -- true once cell count has been reliably detected; prevents false
     last_volt    = 0,   -- pack voltage from the previous cycle; used to detect >1 V jumps for cell re-detection
+    connect_time = 0,   -- getTime() cs of last >1V jump; alerts suppressed during stabilization
     alert_time   = 0,   -- getTime() timestamp of the last low-voltage alert (cs)
     alert_volt   = 0,   -- cell voltage at the time of the last alert; drives BATTERY_ALERT_STEP comparison
     cfg_idx      = 1,   -- active battery chemistry index into BAT_CFG_* arrays (1=LiPo, 2=LiHV, 3=LiIon)
@@ -235,8 +240,8 @@ local bat_state = {
     -- Cached strings for drawing (rebuilt only when values change)
     rx_fmt       = "0.00V", -- formatted pack voltage  ("16.80V")
     cell_fmt     = "0.00V", -- formatted cell voltage  ("4.20V")
-    cell_s       = "0S",    -- formatted cell count    ("4S")
     pct_val      = 0,       -- battery state-of-charge 0.0–1.0 (linear between VMIN and VMAX)
+    cell_s       = "0S",    -- formatted cell count    ("4S")
     pct_str      = "0%",    -- formatted state-of-charge percentage ("84%")
     -- TX battery
     bat_tx       = 0,    -- TX battery voltage from "tx-voltage" sensor (V)
@@ -245,24 +250,16 @@ local bat_state = {
     -- Change-detection sentinels (initialised to -1 so the first real value always triggers a string rebuild)
     last_cells   = -1,
     last_rx_bt   = -1,
-    last_bat_tx  = -1
+    last_bat_tx  = 0
 }
 
 local pwr_state = {
     watts   = 0,  -- last integer watt value; gate for pwr_strs[1..3] rebuild
     eff     = 0,  -- last integer efficiency value (mAh/km or %/km); gate for pwr_strs[4..6] rebuild
-    mins    = 0,  -- last estimated flight-time remaining in minutes; gate for pwr_strs[7] rebuild
-    pct_val = 0   -- battery state-of-charge 0.0–1.0; recalculated independently for the PWR bar
+    mins    = 0   -- last estimated flight-time remaining in minutes; gate for pwr_strs[7] rebuild
 }
 
 local lnk_state = {
-    lq      = 0,    -- raw RX link quality 0–100 (RQly) or RSSI 0–100
-    tqly    = 0,    -- TX link quality 0–100 (ELRS/Crossfire only; 0 if absent)
-    rss1    = 0,    -- antenna-1 RSSI in dBm (ELRS only)
-    rss2    = 0,    -- antenna-2 RSSI in dBm (ELRS only)
-    rsnr    = 0,    -- signal-to-noise ratio in dB (ELRS/Crossfire only)
-    rfmd    = 0,    -- RF packet rate in Hz, e.g. 250 (ELRS only)
-    tpwr    = nil,  -- TX power in mW from TPWR sensor; nil if absent
     lq_pct  = 0,    -- normalised 0–100 for draw_fill_bar (= lq clamped 0..100)
     -- Change-detection sentinels (-1 / -999 so first real value always rebuilds)
     last_lq   = -1, last_tqly = -1,
@@ -278,7 +275,12 @@ local home_state = {
 }
 
 -- Live flight statistics; populated by background(), reset by reset_stats()
-local stats = {}
+local stats = {
+  max_alt=0, total_dist=0, min_voltage=0, max_speed=0, max_current=0,
+  max_sats=0, mahdrain=0, flight_time=0, min_lq=999,
+  last_min_v=-1, last_max_a=-1, last_max_alt=-1, last_dist=-1,
+  last_max_spd=-1, last_sats=-1, last_mah=-1, last_flt_s=-1, last_min_lq=-1
+}
 
 local fm_str      = nil    -- raw flight-mode string from FM/FMod sensor; nil when telemetry is lost
 local fm_armed    = false  -- true when fm_str is not nil and not in FM_DISARMED{}
@@ -389,6 +391,12 @@ local function reset_stats()
     stats.max_alt = 0; stats.total_dist = 0; stats.min_voltage = 0
     stats.max_speed = 0; stats.max_current = 0; stats.max_sats = 0
     stats.mahdrain = 0; stats.flight_time = 0; stats.min_lq = 999
+    -- Reset sentinels so update_tot_strings() rebuilds after manual reset
+    stats.last_min_v   = -1;  stats.last_max_a   = -1
+    stats.last_max_alt = -1;  stats.last_dist    = -1
+    stats.last_max_spd = -1;  stats.last_sats    = -1
+    stats.last_mah     = -1;  stats.last_flt_s   = -1
+    stats.last_min_lq  = -1
 end
 
 -- Builds the GF(256) exponent and log lookup tables used by the Reed-Solomon
@@ -600,8 +608,13 @@ local function detect_sensors()
         end
     end
     capa_is_pct = (sensors.capa == "Fuel")
-    loc_is_elrs = (sensors.loc == "1RSS" or sensors.loc == "2RSS")
+    link_is_elrs = (sensors.loc == "1RSS" or sensors.loc == "2RSS")
     sensors.done = true
+
+    pwr_strs[8] = (capa_is_pct and USE_IMPERIAL) and "%/mi"
+           or (capa_is_pct)                  and "%/km"
+           or USE_IMPERIAL                   and "mAh/mi"
+           or                                    "mAh/km"
 end
 
 -- EdgeTX GPS sensor returns {lat=0, lon=0} before acquiring a fix.
@@ -709,6 +722,7 @@ local function update_gps_position(cur_lat, cur_lon, alt, gspd)
     gps_state.lon = cur_lon
     gps_state.alt = alt
     gps_state.fix = true
+    gps_state.had_fix = true   -- latch: at least one valid fix has been acquired this session
 
     if alt  > stats.max_alt   then stats.max_alt   = alt  end
     if gspd > stats.max_speed then stats.max_speed = gspd end
@@ -720,12 +734,12 @@ end
 -- when the detected cell count changes.
 local function update_bat_strings()
     local idx = bat_state.cfg_idx
-    
+
     if bat_state.rx_bt ~= bat_state.last_rx_bt then
         bat_state.last_rx_bt = bat_state.rx_bt
         bat_state.rx_fmt     = string_fmt("%.2fV", bat_state.rx_bt)
         bat_state.cell_fmt   = string_fmt("%.2fV", bat_state.cell_voltage)
-        bat_state.pct_val    = bat_state.cells > 0 and
+        bat_state.pct_val    = bat_state.identified and
             math_max(0, math_min(1, (bat_state.cell_voltage - BAT_CFG_VMIN[idx]) / BAT_CFG_VRNG[idx])) or 0
         bat_state.pct_str = string_fmt("%d%%", math_floor(bat_state.pct_val * 100))
     end
@@ -739,7 +753,7 @@ local function update_bat_strings()
         bat_state.last_cells    = bat_state.cells
         bat_state.cell_s        = string_fmt("%dS", bat_state.cells)
         bat_state.chem_cell_str = string_fmt("%s [%s]", BAT_CFG_TEXT[idx],
-            bat_state.cells > 0 and bat_state.cell_s or "-S")
+            bat_state.identified and bat_state.cell_s or "-S")
     end
 end
 
@@ -755,31 +769,36 @@ local function update_lnk_strings()
         lnk_state.last_lq = lq
         lnk_strs[1] = string_fmt("%d%%", lq)
     end
+
     local tq = sensors.tqly and getValue(sensors.tqly) or 0
     if tq ~= lnk_state.last_tqly then
         lnk_state.last_tqly = tq
         lnk_strs[2] = sensors.tqly and string_fmt("TQly:%d%%", tq) or ""
     end
+
     local r1 = sensors.rss1 and getValue(sensors.rss1) or 0
     local r2 = sensors.rss2 and getValue(sensors.rss2) or 0
     if r1 ~= lnk_state.last_rss1 or r2 ~= lnk_state.last_rss2 then
         lnk_state.last_rss1, lnk_state.last_rss2 = r1, r2
-        lnk_strs[3] = loc_is_elrs and string_fmt("1:%d  2:%d", r1, r2) or ""
+        lnk_strs[3] = link_is_elrs and string_fmt("1:%d  2:%d", r1, r2) or ""
     end
+
     local snr = sensors.rsnr and getValue(sensors.rsnr) or 0
     if snr ~= lnk_state.last_rsnr then
         lnk_state.last_rsnr = snr
         lnk_strs[4] = sensors.rsnr and string_fmt("SNR:%ddB", snr) or ""
     end
+
     local rf = sensors.rfmd and getValue(sensors.rfmd) or 0
     if rf ~= lnk_state.last_rfmd then
         lnk_state.last_rfmd = rf
 	lnk_strs[5] = sensors.rfmd and string_fmt("RF:%dHz", rf) or ""
     end
+
     local tp = sensors.tpwr and getValue(sensors.tpwr) or nil
     if tp ~= lnk_state.last_tpwr then
         lnk_state.last_tpwr = tp
-        lnk_strs[6] = tp and string_fmt("TXP:%dmW", tp) or "TPX:---"
+        lnk_strs[6] = tp and string_fmt("TXP:%dmW", tp) or "TXP:---"
     end
 end
 
@@ -810,26 +829,32 @@ local function update_tot_strings()
         stats.last_min_v = stats.min_voltage
         tot_strs[1] = string_fmt("MIN V:%.2fV", stats.min_voltage)
     end
+
     if stats.max_current ~= stats.last_max_a then
         stats.last_max_a = stats.max_current
         tot_strs[2] = string_fmt("MAX AMP: %.1fA", stats.max_current)
     end
+
     if stats.max_alt ~= stats.last_max_alt then
         stats.last_max_alt = stats.max_alt
         tot_strs[3] = string_fmt("MAX ALT: %.0f%s", stats.max_alt * alt_factor, alt_unit)
     end
+
     if stats.total_dist ~= stats.last_dist then
         stats.last_dist = stats.total_dist
         tot_strs[4] = string_fmt("DIST: %s", format_dist(stats.total_dist))
     end
+
     if stats.max_speed ~= stats.last_max_spd then
         stats.last_max_spd = stats.max_speed
         tot_strs[5] = string_fmt("MAX SPD: %.1f%s", stats.max_speed * spd_factor, spd_unit)
     end
+
     if stats.max_sats ~= stats.last_sats then
         stats.last_sats = stats.max_sats
         tot_strs[6] = string_fmt("MAX SATS: %d", stats.max_sats)
     end
+
     if stats.mahdrain ~= stats.last_mah then
         stats.last_mah = stats.mahdrain
         tot_strs[7] = capa_is_pct and string_fmt("DRAIN: %d%%", stats.mahdrain) or string_fmt("DRAIN: %dmAh", stats.mahdrain)
@@ -883,21 +908,9 @@ local function update_pwr_strings()
 	pwr_strs[6] = string_fmt("%d", eff_int)
     end
 
-    pwr_strs[8] = (capa_is_pct and USE_IMPERIAL) and "%/mi"
-           or (capa_is_pct)                  and "%/km"
-           or USE_IMPERIAL                   and "mAh/mi"
-           or                                    "mAh/km"
-
-    -- 3. Flight Time Remaining Bar
-    -- Independently calculate battery percentage to ensure lazy evaluation safety
-    local idx = bat_state.cfg_idx
-    pwr_state.pct_val = bat_state.cells > 0 
-        and math_max(0, math_min(1, (bat_state.cell_voltage - BAT_CFG_VMIN[idx]) / BAT_CFG_VRNG[idx])) 
-        or 0
-
     local mins = 0
-    if bat_state.cells > 0 and bat_state.curr > 0.5 then
-        mins = math_floor(BAT_CAPACITY_MAH * pwr_state.pct_val / bat_state.curr * 60 / 1000)
+    if bat_state.identified and bat_state.curr > 0.5 then
+	mins = math_floor(BAT_CAPACITY_MAH * bat_state.pct_val / bat_state.curr * 60 / 1000)
     end
 
     if mins ~= pwr_state.mins then
@@ -946,6 +959,21 @@ local function update_rad_strings()
     end
 end
 
+-- Dispatches the correct update_*_strings() function for the currently
+-- active tab. Centralises the if/elseif dispatch chain that would otherwise
+-- be duplicated between background() (periodic 1 Hz refresh) and run()
+-- (immediate refresh on tab switch). Adding a new tab only requires updating
+-- this single function instead of two separate call sites.
+local function update_active_tab_strings()
+    local tab = TABS[current_page]
+    if     tab == "BAT" then update_bat_strings()
+    elseif tab == "TOT" then update_tot_strings()
+    elseif tab == "PWR" then update_pwr_strings()
+    elseif tab == "LNK" then update_lnk_strings()
+    elseif tab == "RAD" then update_rad_strings()
+    end
+end
+
 -- Uses v_max + 0.05 V as the per-cell ceiling instead of v_max to avoid
 -- misclassifying a freshly charged pack. Example: a 4S LiPo at 16.82 V
 -- divided by 4.20 gives 4.004 → floor = 4 correct, but at exactly 16.80 V
@@ -971,8 +999,8 @@ end
 -- flight starts and cleanly closes the XML tags upon disarming.
 local function gpx_state()
     if GPX_LOG_ENABLED then
-        local should_record = armed_display and gps_state.fix
-        
+        local should_record = armed_display
+
         if should_record and not gpx_is_recording then
             gpx_file_current = get_next_gpx_filename()
             local file = io.open(gpx_file_current, "w")
@@ -1062,6 +1090,10 @@ local function background()
         -- so that Home position locks for the Radar and stats accumulate correctly.
         if gps_state.sats >= MIN_SATS and is_valid_gps(cur_lat, cur_lon) then
             update_gps_position(cur_lat, cur_lon, alt, gspd)
+	elseif gps_state.sats < MIN_SATS and gps_state.fix then
+	    gps_state.fix      = false
+	    gps_state.vspd     = 0
+	    gps_state.prev_alt = 0
         end
 
         -- Lock home on first valid fix; never resets mid-flight.
@@ -1080,9 +1112,9 @@ local function background()
 	if raw_vspd ~= 0 then
     	    gps_state.vspd = raw_vspd
 	elseif gps_state.fix and gps_state.prev_alt ~= 0 then
-    	    gps_state.vspd = (alt - gps_state.prev_alt) / (UPDATE_RATE / CENTISECS_PER_SEC)
+    	    gps_state.vspd = (alt - gps_state.prev_alt) * CENTISECS_PER_SEC / UPDATE_RATE
 	end
-	gps_state.prev_alt = alt
+	if gps_state.fix then gps_state.prev_alt = alt end
     end
 
     if ARM_SWITCH ~= "" then
@@ -1106,36 +1138,35 @@ local function background()
 
     gpx_state()
 
-    -- Cell count is re-inferred whenever pack voltage jumps more than 1 V.
-    -- This handles two cases:
-    --   1. Cold start: RxBt climbs from 0 V when the drone powers on.
-    --   2. Battery swap: pack voltage changes significantly mid-session.
-    -- A 1 V hysteresis avoids false re-detection from normal sag under load.
-    if math_abs(bat_state.rx_bt - bat_state.last_volt) > 1.0 then bat_state.cells = detect_cells(bat_state.rx_bt) end
+    -- Cell count is re-inferred only when the battery is physically reconnected
+    -- (last_volt was near zero, indicating a real disconnect) or on the very first
+    -- detection (not yet identified). This prevents false re-detection when a deeply
+    -- discharged battery sags under load and then recovers by >1 V while the drone
+    -- is still flying. A genuine battery swap always passes through near-zero first.
+    if (bat_state.rx_bt - bat_state.last_volt) > 1.0 then
+        if not bat_state.identified or bat_state.last_volt < 2.0 then
+            bat_state.cells = detect_cells(bat_state.rx_bt)
+            if bat_state.cells > 0 then bat_state.identified = true end
+        end
+        bat_state.connect_time = current_time
+        bat_state.alert_volt = 0
+    elseif bat_state.rx_bt < 2.0 then
+        -- elseif prevents a 1S LiIon at 1.0-2.0V from being identified
+        -- and immediately cleared in the same cycle.
+	bat_state.identified = false
+    end
 
     bat_state.last_volt    = bat_state.rx_bt
-    bat_state.cell_voltage = bat_state.cells > 0 and (bat_state.rx_bt / bat_state.cells) or 0
+    bat_state.cell_voltage = bat_state.identified and (bat_state.rx_bt / bat_state.cells) or 0
 
-    if bat_state.cells > 0 then
+    if bat_state.identified then
         if stats.min_voltage == 0 or bat_state.cell_voltage < stats.min_voltage then
             stats.min_voltage = bat_state.cell_voltage
         end
     end
 
-    local current_tab_name = TABS[current_page]
-
     -- Allocate memory for strings only if viewing their respective page
-    if current_tab_name == "BAT" then 
-        update_bat_strings() 
-    elseif current_tab_name == "TOT" then 
-        update_tot_strings() 
-    elseif current_tab_name == "PWR" then 
-        update_pwr_strings() 
-    elseif current_tab_name == "LNK" then
-	update_lnk_strings()
-    elseif current_tab_name == "RAD" then
-        update_rad_strings()
-    end
+    update_active_tab_strings()
 
     -- GPS cache: shared by the fixed-GPS info line and the waiting-for-fix screen
     if gps_state.alt ~= 0 then
@@ -1176,7 +1207,7 @@ local function draw_qr_directly(lat_str, lon_str)
     local qr_size = 25 * qr_scale + 4
     lcd_drawFilledRect(LAYOUT.qr_x, LAYOUT.qr_y, qr_size, qr_size, SOLID)
 
-    -- 1. Dibujar los patrones fijos (Base Matrix)
+    -- 1. Draw fixed patterns (Base Matrix)
     for r = 0, 24 do
         local row_bits = QR_BASE_V[r + 1]
         if row_bits ~= 0 then
@@ -1192,7 +1223,7 @@ local function draw_qr_directly(lat_str, lon_str)
     qr_bi = 0
     for i = 1, 12 do qr_b[i] = 0 end
 
-    -- Empaquetar bits
+    -- Bit packing
     qr_pack_bits(4, 4)
     qr_pack_bits(#t, 8)
     for i = 1, #t do qr_pack_bits(string_byte(t, i), 8) end
@@ -1231,7 +1262,7 @@ local function draw_qr_directly(lat_str, lon_str)
     for i = 1, 16 do qr_pack_bits(qr_ec[i], 8) end
     qr_pack_bits(0, 7)
 
-    -- 2. Escaneo diagonal y dibujo directo en el LCD
+    -- 2. Diagonal scanning and direct rendering to LCD
     local cx, cy, dir, bd = 24, 24, -1, 0
     while cx >= 0 do
         if cx == 6 then cx = cx - 1 end
@@ -1330,9 +1361,9 @@ local function draw_bat_page(blink_on)
     lcd_drawText(SCREEN_W, LAYOUT.bat_label_y, "TX", SMLSIZE + RIGHT)
     lcd_drawText(SCREEN_CENTER_X, LAYOUT.bat_label_y, bat_state.chem_cell_str, SMLSIZE + CENTER)
 
-    local cell_voltage_alert = (BATTERY_ALERT_ENABLED and bat_state.cells > 0 and bat_state.cell_voltage < bat_state.threshold)
+    local cell_voltage_alert = (BATTERY_ALERT_ENABLED and bat_state.identified and bat_state.cell_voltage < bat_state.threshold)
 
-    if bat_state.cells > 0 then
+    if bat_state.identified then
 	lcd_drawText(0, LAYOUT.bat_cell_y, bat_state.cell_fmt,
 	    SMLSIZE + (cell_voltage_alert and INVERS or 0))
     else
@@ -1351,7 +1382,7 @@ local function draw_bat_page(blink_on)
         lcd_drawText(SCREEN_W, LAYOUT.bat_pct_y, bat_state.lbl_vmax, SMLSIZE + RIGHT)
 
 	draw_fill_bar(LAYOUT.bar_x, LAYOUT.bat_bar_y, LAYOUT.bar_w, 7,
-            bat_state.cells > 0 and bat_state.pct_val or 0)
+            bat_state.identified and bat_state.pct_val or 0)
     end
 end
 
@@ -1362,7 +1393,8 @@ end
 -- this page is active, entirely eliminating background memory allocation.
 -- If the GPS fix is lost or pending, displays a "WAITING GPS" prompt.
 local function draw_gps_page(blink_on)
-    if gps_state.fix and not telemetry_live and blink_on then
+    local gps_lost = gps_state.had_fix and not gps_state.fix
+    if (gps_lost or (gps_state.fix and not telemetry_live)) and blink_on then
         lcd_drawRect(0, CONTENT_Y, SCREEN_W, LAYOUT.gps_lost_h, SOLID)
     end
 
@@ -1375,7 +1407,18 @@ local function draw_gps_page(blink_on)
 	-- Reads the pre-calculated Plus Code string to guarantee 0 bytes RAM overhead per frame
 	lcd_drawText(SCREEN_W - 4, LAYOUT.url_y, gps_state.plus_code, FONT_INFO + RIGHT)
 	draw_qr_directly(gps_state.lat_str, gps_state.lon_str)
+    elseif gps_state.had_fix then
+	-- GPS lost mid-flight: render last known position in full, including QR.
+	-- The QR encodes the last valid plus_code, which is the pilot's only
+	-- reference to locate the drone if it crashes during the shadow.
+	lcd_drawText(SCREEN_CENTER_X, LAYOUT.gps_tl_y,    "GPS LOST",        FONT_INFO   + CENTER + INVERS)
+	lcd_drawText(SCREEN_W - 4,    LAYOUT.coord_lat_y, gps_state.lat_str, FONT_COORDS + RIGHT)
+	lcd_drawText(SCREEN_W - 4,    LAYOUT.coord_lon_y, gps_state.lon_str, FONT_COORDS + RIGHT)
+	lcd_drawText(SCREEN_CENTER_X, LAYOUT.info_y,      gps_str_info,      FONT_INFO   + CENTER)
+	lcd_drawText(SCREEN_CENTER_X, LAYOUT.sats_y,      gps_sats_str,      FONT_INFO   + CENTER)
+	draw_qr_directly(gps_state.lat_str, gps_state.lon_str)
     else
+	-- cold start: no fix has ever been acquired this session
         lcd_drawText(SCREEN_CENTER_X, LAYOUT.waiting_y, "WAITING GPS", FONT_COORDS + CENTER)
         lcd_drawText(SCREEN_CENTER_X, LAYOUT.sats_y, gps_sats_str, FONT_INFO + CENTER)
     end
@@ -1436,10 +1479,10 @@ end
 local function draw_lnk_page(blink_on)
     local warn    = lnk_state.lq_pct < LNK_LQ_WARN
     local lq_flag = FONT_COORDS + CENTER + (warn and blink_on and INVERS or 0)
-    local lbl     = loc_is_elrs and "RQly" or "RSSI"
+    local lbl     = link_is_elrs and "RQly" or "RSSI"
 
     lcd_drawText(SCREEN_CENTER_X, LAYOUT.lnk_lq_y, lnk_strs[1], lq_flag)
-    if loc_is_elrs then
+    if link_is_elrs then
         lcd_drawText(0, LAYOUT.lnk_main_y, lnk_strs[4], SMLSIZE)
         lcd_drawText(SCREEN_W, LAYOUT.lnk_main_y, lnk_strs[5], SMLSIZE + RIGHT)
         lcd_drawText(0,        LAYOUT.lnk_line2_y, lnk_strs[3], SMLSIZE)
@@ -1460,19 +1503,18 @@ local function draw_pwr_page()
     lcd_drawText(SCREEN_W - 4, LAYOUT.pwr_y0, pwr_strs[6], DBLSIZE + RIGHT)
 
     -- Row 1: Voltage (L) & Efficiency Unit (R)
-    lcd_drawText(4, LAYOUT.pwr_y1, pwr_strs[1], FONT_INFO)
-    lcd_drawText(SCREEN_W - 4, LAYOUT.pwr_y1, pwr_strs[8], FONT_INFO + RIGHT)
-
     -- Row 2: Consumed (L) & Current/Amps (R)
-    lcd_drawText(4, LAYOUT.pwr_y2, pwr_strs[4], FONT_INFO)
-    lcd_drawText(SCREEN_W - 4, LAYOUT.pwr_y2, pwr_strs[2], FONT_INFO + RIGHT)
-
     -- Row 3: Estimated Time (L) & Distance (R)
-    lcd_drawText(4, LAYOUT.pwr_y3, pwr_strs[7], FONT_INFO)
-    lcd_drawText(SCREEN_W - 4, LAYOUT.pwr_y3, pwr_strs[5], FONT_INFO + RIGHT)
+    local pys = {LAYOUT.pwr_y1, LAYOUT.pwr_y2, LAYOUT.pwr_y3}
+    local pli = {1, 4, 7}
+    local pri = {8, 2, 5}
+    for i = 1, 3 do
+	lcd_drawText(4,            pys[i], pwr_strs[pli[i]], FONT_INFO)
+	lcd_drawText(SCREEN_W - 4, pys[i], pwr_strs[pri[i]], FONT_INFO + RIGHT)
+    end
 
     -- Bottom Bar: Remaining Battery Capacity
-    draw_fill_bar(LAYOUT.bar_x, LAYOUT.bat_bar_y, LAYOUT.bar_w, 7, pwr_state.pct_val)
+    draw_fill_bar(LAYOUT.bar_x, LAYOUT.bat_bar_y, LAYOUT.bar_w, 7, bat_state.pct_val)
 end
 
 -- Draws the RAD (Radar) tab: a head-up tactical radar on the left and a
@@ -1536,12 +1578,12 @@ local function draw_rad_page()
 
     -- Data Panel (Vertical separator removed, labels shifted right)
     local lbl_x = dx + 6
-    lcd_drawText(lbl_x,    LAYOUT.rad_dy1, "DIST", SMLSIZE)
-    lcd_drawText(SCREEN_W, LAYOUT.rad_dy1, rad_strs[1], SMLSIZE + RIGHT)
-    lcd_drawText(lbl_x,    LAYOUT.rad_dy2, "ALT",  SMLSIZE)
-    lcd_drawText(SCREEN_W, LAYOUT.rad_dy2, rad_strs[2], SMLSIZE + RIGHT)
-    lcd_drawText(lbl_x,    LAYOUT.rad_dy3, "VSPD", SMLSIZE)
-    lcd_drawText(SCREEN_W, LAYOUT.rad_dy3, rad_strs[3], SMLSIZE + RIGHT)
+    local rys  = {LAYOUT.rad_dy1, LAYOUT.rad_dy2, LAYOUT.rad_dy3}
+    local rlbl = {"DIST", "ALT", "VSPD"}
+    for i = 1, 3 do
+	lcd_drawText(lbl_x,   rys[i], rlbl[i],    SMLSIZE)
+	lcd_drawText(SCREEN_W, rys[i], rad_strs[i], SMLSIZE + RIGHT)
+    end
 end
 
 -- Displays a centered notification banner for TOAST_DURATION centiseconds.
@@ -1609,6 +1651,7 @@ local function handle_page_enter()
         bat_state.lbl_vmin  = string_fmt("%.2fV", BAT_CFG_VMIN[idx])
         bat_state.lbl_vmax  = string_fmt("%.2fV", BAT_CFG_VMAX[idx])
         bat_state.cells = detect_cells(bat_state.rx_bt)
+        bat_state.identified = bat_state.cells > 0
         bat_state.cell_voltage = bat_state.cells > 0 and (bat_state.rx_bt / bat_state.cells) or 0
         bat_state.last_volt  = bat_state.rx_bt
         bat_state.last_rx_bt = -1
@@ -1639,7 +1682,7 @@ end
 
 -- Normalises a raw LOC sensor reading to a 0–100% signal strength value.
 -- Returns 0 immediately when sig is nil (no sensor read).
--- Two scaling modes depending on loc_is_elrs:
+-- Two scaling modes depending on link_is_elrs:
 --   · ELRS (1RSS/2RSS): segmented dBm mapping using LOC_SEG_NEAR (-15 dBm)
 --     and LOC_SEG_FAR (-70 dBm) as boundaries. Values at or above
 --     LOC_SEG_NEAR return 100; at or below LOC_SEG_FAR return 10 (never 0,
@@ -1650,8 +1693,8 @@ end
 -- in draw_loc_page() and update_loc_sensor().
 local function loc_normalise(sig)
     if not sig then return 0 end
-    if loc_is_elrs then
-        -- dBm → 0–100, using LOC_SEG_NEAR/LOC_SEG_FAR
+    if link_is_elrs then
+        -- dBm 0–100, using LOC_SEG_NEAR/LOC_SEG_FAR
         if     sig >= LOC_SEG_NEAR then return 100
         elseif sig <= LOC_SEG_FAR  then return 10
         else
@@ -1682,9 +1725,12 @@ end
 -- (BATTERY_ALERT_STEP) since the last alert. Both tiers must be satisfied
 -- simultaneously to prevent alert spam during voltage sag under load.
 -- All alerts are suppressed when current draw exceeds SAG_CURRENT_THRESHOLD.
+-- Alerts are also suppressed for BATTERY_STABILIZE_TIME cs after a >1V voltage
+-- jump to prevent false positives during battery connection/swap.
 local function update_battery_alert(current_time)
-    if not BATTERY_ALERT_ENABLED or bat_state.cells == 0
-        or bat_state.curr > SAG_CURRENT_THRESHOLD then return end
+    if not BATTERY_ALERT_ENABLED or not bat_state.identified
+        or bat_state.curr > SAG_CURRENT_THRESHOLD
+        or (current_time - bat_state.connect_time) < BATTERY_STABILIZE_TIME then return end
 
     if bat_state.cell_voltage < bat_state.threshold then
         if bat_state.alert_volt == 0 or
@@ -1782,15 +1828,10 @@ local function run(event)
         end
     end
 
-    local current_tab_name = TABS[current_page]
 
     -- Bypasses the background UPDATE_RATE limit to ensure immediate fresh data
     if current_page ~= last_page then
-        if current_tab_name == "BAT" then update_bat_strings() end
-        if current_tab_name == "TOT" then update_tot_strings() end
-	if current_tab_name == "PWR" then update_pwr_strings() end
-	if current_tab_name == "LNK" then update_lnk_strings() end
-        if current_tab_name == "RAD" then update_rad_strings() end
+        update_active_tab_strings()
         last_page = current_page
         force_redraw = true
     end
@@ -1830,6 +1871,7 @@ local function run(event)
     end
 
     -- Locator
+    local current_tab_name = TABS[current_page]
     if current_tab_name == "LOC" and loc_active then update_loc_sensor(current_time) end
 
     if not force_redraw then return 0 end
